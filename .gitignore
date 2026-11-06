@@ -1,0 +1,42 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Downloaded binaries (setup.bat downloads these)
+bin/
+*.dll
+*.exe
+*.7z
+
+# Build output (PyInstaller)
+build/
+dist/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local files
+.env
+*.log
+cache/
+temp/
+
+# Media (test videos / exports)
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.mp3
+*.wav
+*.aac
+*.flac
+*.ogg
+*.m4a
