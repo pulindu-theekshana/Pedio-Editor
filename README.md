@@ -11,3 +11,9 @@ A simple video editor built with Python, PySide6, mpv and FFmpeg (Windows).
 venv\Scripts\activate
 python main.py
 ```
+
+## Editing
+- Import one or more videos (Ctrl+O or drag and drop). They are joined one after another on the timeline.
+- Click a clip to select it. Drag its yellow edges to trim, drag the clip itself to reorder.
+- Space = play / pause, S = split at the playhead, Del = delete the selected clip, [ and ] = cut the start / end of the clip at the playhead.
+- Snap (above the timeline) pulls edges to the playhead and to other clips.
