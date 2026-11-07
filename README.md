@@ -17,3 +17,7 @@ python main.py
 - Click a clip to select it. Drag its yellow edges to trim, drag the clip itself to reorder.
 - Space = play / pause, S = split at the playhead, Del = delete the selected clip, [ and ] = cut the start / end of the clip at the playhead.
 - Snap (above the timeline) pulls edges to the playhead and to other clips.
+
+## Export
+- Toolbar > Export > Export Video. Pick a file name; the whole timeline is saved as an MP4 (H.264 + AAC).
+- The window shows a progress bar and a Cancel button. A cancelled or failed export leaves no broken file.
