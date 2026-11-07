@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (QFileDialog, QMainWindow, QMessageBox,
 
 from pedio.core.clips import Project
 from pedio.core.workers import ProbeWorker
+from pedio.ui.export_dialog import ExportDialog
 from pedio.ui.player import VIDEO_EXTS, PlayerWidget
 from pedio.ui.timeline import TimelinePanel
 from pedio.ui.toolbar import BottomToolbar
@@ -145,6 +146,29 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Trimmed the end of the clip")
 
+    # ---- export (the same clip list the player plays)
+    def export_video(self):
+        clips = self.project.play_list()
+        if not clips:
+            self.statusBar().showMessage("Nothing to export. Import a video first")
+            return
+        first = self.project.clips[0].path
+        default = os.path.splitext(first)[0] + "_edit.mp4"
+        path, _ = QFileDialog.getSaveFileName(self, "Export video", default, "MP4 video (*.mp4)")
+        if not path:
+            return
+        if not path.lower().endswith(".mp4"):
+            path += ".mp4"
+        same = os.path.normcase(os.path.abspath(path))
+        if any(os.path.normcase(os.path.abspath(c[0])) == same for c in clips):
+            QMessageBox.warning(self, "Export", "This file is used by the edit. Choose another file name.")
+            return
+        dialog = ExportDialog(clips, path, parent=self)
+        dialog.exec()
+        if dialog.succeeded:
+            self.statusBar().showMessage(f"Exported {os.path.basename(path)}")
+        dialog.deleteLater()
+
     # ---- drag and drop
     @staticmethod
     def dropped_videos(mime):
@@ -174,6 +198,7 @@ class MainWindow(QMainWindow):
             "Trim End": self.trim_end_to_playhead,
             "Split": self.split_at_playhead,
             "Delete": self.delete_clip,
+            "Export Video": self.export_video,
         }
         action = actions.get(tool)
         if action:
