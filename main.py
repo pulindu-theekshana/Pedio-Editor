@@ -7,21 +7,12 @@ setup_paths()  # adds the mpv dll + ffmpeg to PATH (must run before `import mpv`
 
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QKeySequence, QShortcut  # noqa: E402
-from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QLabel, QMainWindow,  # noqa: E402
-                               QMessageBox, QSplitter, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QFileDialog, QMainWindow, QMessageBox,  # noqa: E402
+                               QSplitter, QVBoxLayout, QWidget)
 
 from player import VIDEO_EXTS, PlayerWidget  # noqa: E402
+from timeline import TimelinePanel  # noqa: E402
 from toolbar import BottomToolbar  # noqa: E402
-
-
-def placeholder(text, style):
-    frame = QFrame()
-    frame.setStyleSheet(style)
-    lay = QVBoxLayout(frame)
-    label = QLabel(text)
-    label.setAlignment(Qt.AlignCenter)
-    lay.addWidget(label)
-    return frame
 
 
 class MainWindow(QMainWindow):
@@ -42,11 +33,8 @@ class MainWindow(QMainWindow):
         self.preview.file_loaded.connect(self.on_file_loaded)
         self.preview.load_failed.connect(self.on_load_failed)
 
-        # timeline area (real timelines come in Step 3)
-        self.timeline = QFrame()
-        tl = QVBoxLayout(self.timeline)
-        tl.addWidget(placeholder("Video timeline", "background:#2b2b2b; color:#ccc;"))
-        tl.addWidget(placeholder("Audio timeline", "background:#232323; color:#ccc;"))
+        # timeline area (ruler, video thumbnails, audio waveform, playhead, zoom)
+        self.timeline = TimelinePanel(self.preview)
 
         splitter = QSplitter(Qt.Vertical)
         splitter.addWidget(self.preview)
@@ -111,6 +99,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"{category} > {tool} (not implemented yet)")
 
     def closeEvent(self, event):
+        self.timeline.shutdown()
         self.preview.shutdown()
         super().closeEvent(event)
 

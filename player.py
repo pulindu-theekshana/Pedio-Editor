@@ -57,6 +57,7 @@ class PlayerWidget(QWidget):
     position_changed = Signal(float)  # seconds
     duration_changed = Signal(float)  # seconds
     playing_changed = Signal(bool)
+    muted_changed = Signal(bool)
 
     # mpv calls us from its own thread; these signals hand the data over to the Qt thread
     _mpv_time = Signal(object)
@@ -231,10 +232,19 @@ class PlayerWidget(QWidget):
         self.player.command("seek", f"{max(seconds, 0.0):.3f}", mode)
 
     def toggle_mute(self):
-        self._muted = not self._muted
-        self.mute_btn.setIcon(self._icon_muted if self._muted else self._icon_volume)
+        self.set_muted(not self._muted)
+
+    def set_muted(self, muted):
+        if muted == self._muted:
+            return
+        self._muted = muted
+        self.mute_btn.setIcon(self._icon_muted if muted else self._icon_volume)
         if self.player is not None:
-            self.player.mute = self._muted
+            self.player.mute = muted
+        self.muted_changed.emit(muted)
+
+    def is_muted(self):
+        return self._muted
 
     def position(self):
         return self.seek.value() / 1000.0
