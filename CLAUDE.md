@@ -63,6 +63,7 @@ New tool dialogs/panels (crop, audio, text, export settings) -> `pedio/ui/` (a `
 - Window shortcuts need an active window (under Xvfb with no window manager call `QApplication.setActiveWindow(win)` in tests).
 - Export uses `Project.play_list()` (same list as the player). Each segment is cut with input seeking (`-ss/-t -i`), scaled/padded to the first clip's size + fps, joined with `concat`; a clip without audio gets `anullsrc` silence. The file is written as `<name>.mp4.part` and renamed when complete.
 - New per-clip effects (crop, rotate, fades, text, speed) go into the per-segment filter chain in `build_command()`; new options go into `ExportSettings`.
+- Keep every effect as plain data on the clip / layer, applied in ONE place for the preview and ONE place for the export. Then keyframes (Steps 14-15) only add "value at time t" and nothing has to be rewritten.
 - Limit: every segment adds about 400 characters to the ffmpeg command line (Windows allows about 32000), so an edit with 60+ separate segments would fail. If that ever happens: write the filter to a file (`-/filter_complex file` on ffmpeg 7+).
 
 ## Main APIs (as built)
@@ -77,19 +78,28 @@ New tool dialogs/panels (crop, audio, text, export settings) -> `pedio/ui/` (a `
 - Mouse: click a clip = select + move playhead. Drag its yellow edge handles = trim. Drag the clip body = reorder. Drag on the ruler = move playhead. Ctrl+wheel = zoom. "Snap" button toggles snapping (clip edges + playhead, 8 px).
 - Keys: Space play/pause, S split at playhead, Del delete (selected clip, else the clip under the playhead), [ and ] cut the start / end of the clip under the playhead, Ctrl+O import (several files allowed).
 
-## Steps (one chat each)
+## Steps (one chat per step; every new feature = a new chat)
 1. Setup + layout - DONE
 2. Import + player (button, drag-drop, play/pause, seek, volume, mute) - DONE
 3. Timelines (thumbnails, waveform + mute button, playhead, zoom) - DONE
 4. Trim / split / delete / join / reorder / snapping + shortcuts - DONE
 5. Basic export (FFmpeg, progress, cancel, background thread) - DONE
-6. Crop / aspect ratio / rotate / flip - NEXT. Preview: mpv video filters / `video-crop`; export: add to the per-segment filter chain in `build_command()`; output size goes in `ExportSettings.size`.
-7. Audio: add sound, extract from video, volume, fade in/out
-8. Video fade in/out transitions (0.1-2 s slider) at split/join points
-9. Text overlays (size, shadow, color, outline size/color, timing, position)
-10. Speed + export settings
-11. Undo/redo, save/open project, autosave, shortcuts
-12. Polish + PyInstaller .exe (bundle mpv dll, vulkan-1.dll, ffmpeg; hardware decoding toggle)
+6. Aspect ratio presets (9:16, 16:9, 4:3, 1:1 ...), crop with a draggable box on the preview, rotate, flip; export matches - NEXT. Preview: mpv video filters / `video-crop`; export: add to the per-segment filter chain in `build_command()`; output size goes in `ExportSettings.size`.
+7. Audio: add MP3/WAV/AAC tracks, extract audio from a video, volume per clip, mute, audio fade in/out (0.1-2 s); export matches
+8. Video fade in/out at split points and where two clips meet (0.1-2 s slider); export matches
+9. Text overlay: size, color, shadow, outline size/color, start/end time on the timeline, drag to position on the preview; export matches
+10. Clip speed + export settings (resolution, quality, format)
+11. Undo/redo, save/open project file, autosave, full keyboard shortcuts
+12. Dark theme, hardware decoding toggle, app icon, PyInstaller .exe (mpv dll, vulkan-1.dll, ffmpeg) = the simple editor is finished
+
+Advanced features (only after Step 12 works):
+13. Image / graphic overlay layers (PNG / JPG: position, scale, opacity, start/end, order); shares the layer model of the text overlay
+14. Keyframes 1: keyframe engine in `pedio/core/` (value at time t, linear / hold / ease), keyframe lane + diamonds on the timeline, animate layer position / scale / opacity; preview + export match
+15. Keyframes 2: animate the video clip (position / scale / rotation / opacity), text and audio volume; copy / paste keyframes
+16. Smart masking 1: AI model setup (downloaded on first use, must run on a CPU-only laptop), brush on the preview (paint foreground / background, eraser), mask of one frame
+17. Smart masking 2: track the mask across the whole clip (background thread, progress, cancel, mask cache on disk), correction strokes on any frame
+18. Smart masking 3: put text / graphics behind the subject (between foreground and background), edge feather; preview + export match
+19. Rebuild the .exe with the AI parts (model downloaded on first use, not bundled)
 
 ## Status / notes
 - Step 4 tested on Linux (libmpv + ffmpeg under Xvfb): 141 checks (model, import, playback across clips incl. a clip without audio and odd file names, split / delete / trim / reorder / snap, shortcuts, editing while playing). Not yet tested on Windows.
