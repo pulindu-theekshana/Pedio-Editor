@@ -9,7 +9,7 @@ def _app_dir() -> Path:
     # Works for the packaged .exe (PyInstaller) and for normal runs
     if getattr(sys, "frozen", False):
         return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-    return Path(__file__).resolve().parent
+    return Path(__file__).resolve().parent.parent
 
 
 APP_DIR = _app_dir()

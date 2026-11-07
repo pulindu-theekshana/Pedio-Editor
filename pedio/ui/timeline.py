@@ -8,7 +8,7 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton, QScrollBar,
                                QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget)
 
-from workers import PEAKS_PER_SECOND, ThumbnailWorker, WaveformWorker, thumb_step
+from pedio.core.workers import PEAKS_PER_SECOND, ThumbnailWorker, WaveformWorker, thumb_step
 
 RULER_H = 28
 TRACK_H = 72

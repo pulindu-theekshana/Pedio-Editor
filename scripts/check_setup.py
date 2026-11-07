@@ -1,7 +1,10 @@
 """Quick check that Python, PySide6, mpv and FFmpeg are all working."""
 import sys
+from pathlib import Path
 
-from paths import setup_paths, find_tool
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from pedio.paths import setup_paths, find_tool  # noqa: E402
 
 setup_paths()
 

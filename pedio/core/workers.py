@@ -11,7 +11,7 @@ from array import array
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
 
-from paths import find_tool
+from pedio.paths import find_tool
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # no black console flash on Windows
 

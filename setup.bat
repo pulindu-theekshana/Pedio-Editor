@@ -58,7 +58,7 @@ if errorlevel 1 goto :fail
 
 REM --- 5. Check everything ---
 echo.
-python check_setup.py
+python scripts\check_setup.py
 if errorlevel 1 goto :fail
 
 echo.
