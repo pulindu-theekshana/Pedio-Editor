@@ -35,11 +35,12 @@ pedio-editor/
     __init__.py        (empty)
     paths.py           APP_DIR, BIN_DIR, setup_paths(), find_tool("ffmpeg")
     core/              logic without widgets (empty __init__.py)
-      workers.py       QThread ffmpeg jobs: ThumbnailWorker, WaveformWorker
+      clips.py         Clip + Project (the edit: clips in order, selection, split/trim/delete/move)
+      workers.py       QThread ffmpeg jobs: ProbeWorker, ThumbnailWorker, WaveformWorker
     ui/                widgets (empty __init__.py)
-      main_window.py   MainWindow (splitter: player / timeline, toolbar at the bottom, import, drag-drop)
-      player.py        PlayerWidget (embedded mpv, play/pause, seek bar, volume, mute)
-      timeline.py      TimelineView (painted) + TimelinePanel (zoom row, track headers, scrollbar)
+      main_window.py   MainWindow (splitter: player / timeline, toolbar at the bottom, multi-import, drag-drop, edit shortcuts)
+      player.py        PlayerWidget (embedded mpv plays the whole edit as one edl:// list; seek bar, volume, mute)
+      timeline.py      TimelineView (painted clips, trim handles, drag reorder, snapping) + TimelinePanel (zoom row, Snap, headers, scrollbar)
       toolbar.py       BottomToolbar + CATEGORIES (Video, Audio, Effects, Text, Export)
 ```
 Where new code goes: clip/project data, export command builder, undo history, project save/load -> `pedio/core/`.
@@ -53,19 +54,29 @@ New tool dialogs/panels (crop, audio, text, export settings) -> `pedio/ui/` (a `
 - ffmpeg jobs run in QThreads with stop(); ignore signals from stale workers (`self.sender()` check).
 - Timeline painting is cached in a QPixmap; the playhead is drawn on top. Call `_invalidate()` when data/zoom/scroll changes.
 - Hide console windows on Windows: `creationflags=CREATE_NO_WINDOW` (see workers.py).
+- Every edit goes through `Project` (never change a `Clip` from the UI directly): it emits `changed`, and the timeline + player follow.
+- `Project.changed` handler order matters: TimelineView (clamps the playhead) first, then `MainWindow.on_project_changed` (reloads the player).
+- No gaps on the timeline: clips are always joined end to end (delete / trim close the gap).
+- The player reloads mpv only when `Project.play_list()` changes; neighbours that continue each other are merged, so a plain split does not reload.
+- Window shortcuts need an active window (under Xvfb with no window manager call `QApplication.setActiveWindow(win)` in tests).
 
 ## Main APIs (as built)
-- `PlayerWidget` signals: `file_loaded(str)`, `load_failed(str)`, `position_changed(float)`, `duration_changed(float)`, `playing_changed(bool)`, `muted_changed(bool)`. Methods: `load(path)`, `toggle_play()`, `seek_to(sec, exact=True)`, `set_muted(bool)`, `toggle_mute()`, `is_muted()`, `position()`, `duration()`, `shutdown()`.
-- `TimelinePanel(player)`: follows the player signals; `clear()`, `shutdown()`. Inner `TimelineView`: `set_duration`, `add_thumbnail`, `add_peaks`, `set_zoom(pps, anchor_x)`, `zoom_fit`, `set_position`, signal `seek_requested(float, bool)`. Zoom is pixels per second (fit .. 300).
-- `BottomToolbar` signal `tool_clicked(category, tool)`; `MainWindow.on_tool()` handles it (only Import works so far).
-- workers: thumbnails about 150 per video (`thumb_step`), waveform 200 peaks per second (min/max of 8 kHz mono audio).
+- `Project` (core/clips.py): `clips` (list of `Clip(path, src_duration, src_in, src_out, id)`), `selected_id`, signals `changed`, `selection_changed`. Reading: `total()`, `starts()`, `boundaries()`, `index_of(id)`, `clip_at(t)`, `play_list()`. Edits (return True if something changed): `add_clip(path, duration)`, `split(t)`, `delete(id)`, `trim_start(id, new_in)`, `trim_end(id, new_out)`, `trim_start_at(t)`, `trim_end_at(t)`, `move(id, new_index)`, `select(id)`. `MIN_CLIP` = 0.1 s.
+- `PlayerWidget` signals: `file_loaded(str)`, `load_failed(str)`, `position_changed(float)`, `duration_changed(float)`, `playing_changed(bool)`, `muted_changed(bool)`. Methods: `set_edit_list([(path, start, length)], position)`, `toggle_play()`, `seek_to(sec, exact=True)`, `set_muted(bool)`, `toggle_mute()`, `is_muted()`, `position()`, `duration()`, `shutdown()`. Positions are timeline seconds (mpv edl:// time).
+- `TimelinePanel(player, project)`: `position()`, `set_playhead(t)`, `shutdown()`. Inner `TimelineView(project)`: `set_zoom(pps, anchor_x)`, `zoom_fit`, `set_position`, `set_playhead`, `set_snap`, signal `seek_requested(float, bool)`. Zoom is pixels per second (fit .. 300). Thumbnails / waveform are kept per source file (`Media`), shared by all clips of that file.
+- `BottomToolbar` signal `tool_clicked(category, tool)`; `MainWindow.on_tool()` handles Import, Trim Start, Trim End, Split, Delete.
+- workers: thumbnails about 150 per video (`thumb_step`), waveform 200 peaks per second (min/max of 8 kHz mono audio), `ProbeWorker` (ffprobe: length + has-video check) before a file is added.
+
+## Using the timeline (Step 4)
+- Mouse: click a clip = select + move playhead. Drag its yellow edge handles = trim. Drag the clip body = reorder. Drag on the ruler = move playhead. Ctrl+wheel = zoom. "Snap" button toggles snapping (clip edges + playhead, 8 px).
+- Keys: Space play/pause, S split at playhead, Del delete (selected clip, else the clip under the playhead), [ and ] cut the start / end of the clip under the playhead, Ctrl+O import (several files allowed).
 
 ## Steps (one chat each)
 1. Setup + layout - DONE
 2. Import + player (button, drag-drop, play/pause, seek, volume, mute) - DONE
 3. Timelines (thumbnails, waveform + mute button, playhead, zoom) - DONE
-4. Trim / split / delete / join + shortcuts - NEXT
-5. Basic export (FFmpeg, progress, cancel, background thread)
+4. Trim / split / delete / join / reorder / snapping + shortcuts - DONE
+5. Basic export (FFmpeg, progress, cancel, background thread) - NEXT. Build the ffmpeg command from `Project.clips` (path, src_in, src_out), in order.
 6. Crop / aspect ratio / rotate / flip
 7. Audio: add sound, extract from video, volume, fade in/out
 8. Video fade in/out transitions (0.1-2 s slider) at split/join points
@@ -75,7 +86,8 @@ New tool dialogs/panels (crop, audio, text, export settings) -> `pedio/ui/` (a `
 12. Polish + PyInstaller .exe (bundle mpv dll, vulkan-1.dll, ffmpeg; hardware decoding toggle)
 
 ## Status / notes
-- Step 3 tested on Linux (libmpv + ffmpeg under Xvfb): 51/51 checks. Not yet tested by me on Windows rendering.
+- Step 4 tested on Linux (libmpv + ffmpeg under Xvfb): 141 checks (model, import, playback across clips incl. a clip without audio and odd file names, split / delete / trim / reorder / snap, shortcuts, editing while playing). Not yet tested on Windows.
 - Folder restructure (Nov 2026): code moved into `pedio/` (core, ui); imports are absolute.
 - Test scripts live outside the repo (they need a Linux display); nothing to run from here.
-- Steps 4+ will need a clip model in `pedio/core/` (list of clips with source in/out), so the timeline can draw more than one clip.
+- No undo yet (Step 11): Delete cannot be undone.
+- Step 5 note: the player's edl:// list is the same edit that must be exported; keep one source of truth (`Project`).

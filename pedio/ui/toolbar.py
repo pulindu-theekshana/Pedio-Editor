@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout,
                                QPushButton, QStackedWidget, QButtonGroup)
 
 CATEGORIES = {
-    "Video":   ["Import", "Trim", "Split", "Delete", "Crop", "Aspect Ratio", "Rotate", "Flip", "Speed"],
+    "Video":   ["Import", "Trim Start", "Trim End", "Split", "Delete", "Crop", "Aspect Ratio", "Rotate", "Flip", "Speed"],
     "Audio":   ["Add Audio", "Extract Audio", "Volume", "Mute", "Fade In/Out"],
     "Effects": ["Fade In", "Fade Out", "Transition"],
     "Text":    ["Add Text", "Edit Text"],

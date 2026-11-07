@@ -1,7 +1,9 @@
-"""Video preview: embedded mpv + play/pause, seek bar, time display, volume and mute."""
-import os
+"""Video preview: embedded mpv + play/pause, seek bar, time display, volume and mute.
 
-from PySide6.QtCore import Qt, Signal
+The player does not open files itself: it plays an edit list [(path, start, length), ...]
+(the clips on the timeline) as one mpv "edl://" playlist, so playback runs across clips.
+"""
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QSlider,
                                QStackedLayout, QStyle, QVBoxLayout, QWidget)
@@ -21,6 +23,14 @@ def fmt_time(seconds):
     h, rest = divmod(total, 3600)
     m, s = divmod(rest, 60)
     return f"{h}:{m:02d}:{s:02d}.{frac}" if h else f"{m:02d}:{s:02d}.{frac}"
+
+
+def edl_url(segments):
+    """[(path, start, length)] -> mpv 'edl://' URL. %N% gives the byte length of the path, so any characters are safe."""
+    parts = []
+    for path, start, length in segments:
+        parts.append(f"%{len(path.encode('utf-8'))}%{path},{start:.3f},{length:.3f}")
+    return "edl://" + ";".join(parts)
 
 
 class SeekSlider(QSlider):
@@ -73,6 +83,11 @@ class PlayerWidget(QWidget):
         self._duration = 0.0
         self._muted = False
         self._last_path = ""
+        self._segments = []          # what mpv has loaded: [(path, start, length)]
+        self._seek_after_load = None  # timeline position to restore once the new list is loaded
+        self._resume = False         # start playing again after the reload
+        self._settling = False       # ignore mpv's time updates until the position is restored
+        self._generation = 0         # counts reloads, so an old settle timer does not end a newer one
 
         style = self.style()
         self._icon_play = style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
@@ -211,12 +226,52 @@ class PlayerWidget(QWidget):
                 pass
 
     # ------------------------------------------------------------------ public API
-    def load(self, path):
-        if not self._ensure_player():
+    def set_edit_list(self, segments, position=0.0):
+        """Play these (path, start, length) pieces one after another. Does nothing if the list did not
+        change. After a reload the player goes back to `position` (timeline seconds) and keeps playing if it was."""
+        segments = [(p, round(s, 3), round(n, 3)) for p, s, n in segments]
+        if segments == self._segments:
             return
-        self._last_path = path
+        self._segments = segments
+        if not segments:
+            self._unload()
+            return
+        if not self._ensure_player():
+            self._segments = []
+            return
+        total = sum(n for _p, _s, n in segments)
+        if self._settling:  # reloaded again before the last reload finished: keep its "resume" choice
+            was_playing = self._resume
+        else:
+            was_playing = self._has_file and not self.player.pause and not self.player.eof_reached
+        self._seek_after_load = min(max(position, 0.0), max(total - 0.04, 0.0))
+        self._resume = bool(was_playing)
+        self._settling = True
+        self._generation += 1
+        self._last_path = segments[0][0]
         self.player.pause = True  # show the first frame, wait for Play
-        self.player.play(path)
+        self.player.play(edl_url(segments))
+
+    def _unload(self):
+        self._seek_after_load = None
+        self._resume = False
+        self._settling = False
+        if self.player is not None:
+            try:
+                self.player.command("stop")
+            except Exception:
+                pass
+        self._reset_state()
+
+    def _reset_state(self):
+        """Back to the empty look: nothing loaded."""
+        self._has_file = False
+        self._duration = 0.0
+        self.play_btn.setEnabled(False)
+        self.seek.setEnabled(False)
+        self.seek.setRange(0, 0)
+        self.time_label.setText(f"{fmt_time(0)} / {fmt_time(0)}")
+        self.stack.setCurrentWidget(self.hint)
 
     def toggle_play(self):
         if self.player is None or not self._has_file:
@@ -227,6 +282,9 @@ class PlayerWidget(QWidget):
 
     def seek_to(self, seconds, exact=True):
         if self.player is None or not self._has_file:
+            return
+        if self._seek_after_load is not None:  # a reload is still running: remember the target instead
+            self._seek_after_load = max(seconds, 0.0)
             return
         mode = "absolute+exact" if exact else "absolute+keyframes"
         self.player.command("seek", f"{max(seconds, 0.0):.3f}", mode)
@@ -265,7 +323,7 @@ class PlayerWidget(QWidget):
         self.seek_to(self.seek.value() / 1000, exact=True)  # exact position when the mouse is released
 
     def _on_time(self, t):
-        if t is None:
+        if t is None or self._settling:
             return
         if not self.seek.isSliderDown():
             self.seek.setValue(int(t * 1000))
@@ -287,17 +345,30 @@ class PlayerWidget(QWidget):
         self.play_btn.setEnabled(True)
         self.seek.setEnabled(True)
         self.stack.setCurrentWidget(self.video)
+        if self._seek_after_load is not None:  # a reload: go back to where we were
+            t, self._seek_after_load = self._seek_after_load, None
+            if t > 0.0 and self.player is not None:
+                self.player.command("seek", f"{t:.3f}", "absolute+exact")
+            QTimer.singleShot(200, lambda g=self._generation: self._end_settle(g))
         self.file_loaded.emit(path or self._last_path)
+
+    def _end_settle(self, generation):
+        if generation != self._generation:
+            return
+        self._settling = False
+        if self.player is None:
+            return
+        if self._resume:
+            self._resume = False
+            self.player.pause = False
+        self._on_time(self.player.time_pos)
 
     def _on_end(self, reason):
         if reason == END_FILE_ERROR:
-            # mpv has already dropped any previous video, so go back to the empty state
-            self._has_file = False
-            self._duration = 0.0
-            self.play_btn.setEnabled(False)
-            self.seek.setEnabled(False)
-            self.seek.setRange(0, 0)
-            self.time_label.setText(f"{fmt_time(0)} / {fmt_time(0)}")
-            self.stack.setCurrentWidget(self.hint)
-            name = os.path.basename(self._last_path) or "that file"
-            self.load_failed.emit(f"Could not open {name}. It may not be a valid video.")
+            # mpv has already dropped the previous list, so go back to the empty state
+            self._seek_after_load = None
+            self._resume = False
+            self._settling = False
+            self._segments = []   # so the next edit loads the list again
+            self._reset_state()
+            self.load_failed.emit("Could not play the timeline. One of the clips may not be a valid video.")

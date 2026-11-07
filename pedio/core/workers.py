@@ -1,5 +1,6 @@
 """Background ffmpeg jobs for the timeline: video thumbnails and audio waveform peaks."""
 import glob
+import json
 import math
 import os
 import shutil
@@ -23,6 +24,39 @@ PEAKS_PER_SECOND = PEAK_RATE // PEAK_BUCKET   # = 200
 def thumb_step(duration, target=150):
     """Seconds between thumbnails: about `target` thumbnails for the whole video, at least 0.5 s apart."""
     return max(0.5, math.ceil(duration / target * 2) / 2)
+
+
+class ProbeWorker(QThread):
+    """Asks ffprobe for the length of a file and checks that it has a video stream."""
+
+    done = Signal(str, float)     # path, duration in seconds
+    failed = Signal(str, str)     # path, message
+
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self.path = path
+
+    def run(self):
+        ffprobe = find_tool("ffprobe")
+        if not ffprobe:
+            self.failed.emit(self.path, "ffprobe was not found. Run setup.bat again.")
+            return
+        cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration:stream=codec_type",
+               "-of", "json", self.path]
+        try:
+            out = subprocess.run(cmd, capture_output=True, timeout=30, creationflags=CREATE_NO_WINDOW)
+            info = json.loads(out.stdout.decode("utf-8", "replace") or "{}")
+            kinds = [s.get("codec_type") for s in info.get("streams", [])]
+            duration = float(info.get("format", {}).get("duration", 0))
+        except Exception:
+            kinds, duration = [], 0.0
+        name = os.path.basename(self.path)
+        if "video" not in kinds:
+            self.failed.emit(self.path, f"Could not open {name}. It may not be a valid video.")
+        elif duration <= 0:
+            self.failed.emit(self.path, f"Could not read the length of {name}.")
+        else:
+            self.done.emit(self.path, duration)
 
 
 class ThumbnailWorker(QThread):
