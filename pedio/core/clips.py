@@ -1,8 +1,11 @@
 """The edit itself: clips joined end to end on one timeline. No widgets here (Qt signals only)."""
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import count
+from typing import NamedTuple
 
 from PySide6.QtCore import QObject, Signal
+
+from pedio.core.transform import Transform, centered_crop
 
 MIN_CLIP = 0.1  # shortest clip allowed, in seconds
 
@@ -16,10 +19,28 @@ class Clip:
     src_in: float         # where the clip starts inside the source file
     src_out: float        # where the clip ends inside the source file
     id: int = field(default_factory=lambda: next(_next_id))
+    size: tuple = (0, 0)  # picture size as a player shows it (phone rotation applied); (0, 0) = unknown
+    meta_rotation: int = 0           # clockwise turn the file asks for in its metadata (phone videos)
+    transform: Transform = Transform()   # mirror / rotate / crop chosen by the user
 
     @property
     def length(self):
         return self.src_out - self.src_in
+
+    @property
+    def picture_size(self):
+        """Size of the picture after mirror + rotate, before the crop. (0, 0) if unknown."""
+        w, h = self.size
+        return (h, w) if self.transform.rotate % 180 == 90 else (w, h)
+
+
+class Segment(NamedTuple):
+    """One piece of the edit for the player and the export: a part of a file + how to show it."""
+    path: str
+    start: float          # seconds into the file
+    length: float
+    transform: Transform = Transform()
+    meta_rotation: int = 0
 
 
 class Project(QObject):
@@ -69,15 +90,16 @@ class Project(QObject):
         return -1, 0.0
 
     def play_list(self):
-        """[(path, start, length)] for the player. Neighbours that continue each other are merged,
-        so a plain split does not change this list (and the player does not have to reload)."""
+        """[Segment] for the player and the export. Neighbours that continue each other (same file,
+        same transform) are merged, so a plain split does not change this list."""
         out = []
         for c in self.clips:
-            if out and out[-1][0] == c.path and abs(out[-1][1] + out[-1][2] - c.src_in) < 1e-6:
-                path, start, length = out[-1]
-                out[-1] = (path, start, length + c.length)
+            last = out[-1] if out else None
+            if (last and last.path == c.path and abs(last.start + last.length - c.src_in) < 1e-6
+                    and last.transform == c.transform):
+                out[-1] = last._replace(length=last.length + c.length)
             else:
-                out.append((c.path, c.src_in, c.length))
+                out.append(Segment(c.path, c.src_in, c.length, c.transform, c.meta_rotation))
         return out
 
     # ------------------------------------------------------------------ selection
@@ -89,14 +111,14 @@ class Project(QObject):
             self.selection_changed.emit()
 
     # ------------------------------------------------------------------ edits (each returns True if something changed)
-    def add_clip(self, path, duration):
-        clip = Clip(path, duration, 0.0, duration)
+    def add_clip(self, path, duration, size=(0, 0), meta_rotation=0):
+        clip = Clip(path, duration, 0.0, duration, size=tuple(size), meta_rotation=meta_rotation)
         self.clips.append(clip)
         self.changed.emit()
         return clip
 
     def split(self, t):
-        """Cut the clip under timeline time t in two."""
+        """Cut the clip under timeline time t in two. Both halves keep the clip's transform (and any later per-clip effect)."""
         i, offset = self.clip_at(t)
         if i < 0:
             return False
@@ -104,7 +126,7 @@ class Project(QObject):
         if offset < MIN_CLIP or c.length - offset < MIN_CLIP:
             return False
         cut = c.src_in + offset
-        self.clips.insert(i + 1, Clip(c.path, c.src_duration, cut, c.src_out))
+        self.clips.insert(i + 1, replace(c, src_in=cut, id=next(_next_id)))
         c.src_out = cut
         self.changed.emit()
         return True
@@ -177,3 +199,47 @@ class Project(QObject):
         self.clips.insert(new_index, self.clips.pop(i))
         self.changed.emit()
         return True
+
+    # ---- picture: mirror / rotate / crop (see core/transform.py)
+    def set_transform(self, clip_id, transform):
+        i = self.index_of(clip_id)
+        if i < 0 or self.clips[i].transform == transform:
+            return False
+        self.clips[i].transform = transform
+        self.changed.emit()
+        return True
+
+    def rotate(self, clip_id, quarter_turns=1):
+        """Turn the clip's picture 90 degrees clockwise (x times)."""
+        i = self.index_of(clip_id)
+        return i >= 0 and self.set_transform(clip_id, self.clips[i].transform.turned(quarter_turns))
+
+    def flip(self, clip_id, horizontal=True):
+        """Mirror the clip's picture left-right (horizontal) or top-bottom."""
+        i = self.index_of(clip_id)
+        return i >= 0 and self.set_transform(clip_id, self.clips[i].transform.mirrored(horizontal))
+
+    def set_crop(self, clip_id, rect):
+        """rect = (x, y, w, h) as fractions of the picture, or None for no crop."""
+        i = self.index_of(clip_id)
+        return i >= 0 and self.set_transform(clip_id, self.clips[i].transform.with_crop(rect))
+
+    def set_aspect_all(self, ratio):
+        """Crop EVERY clip to the biggest centered box with this ratio (w, h); None = remove all crops.
+        Clips whose picture size is unknown are skipped."""
+        changed = False
+        for c in self.clips:
+            w, h = c.picture_size
+            if ratio is None:
+                crop = None
+            elif w > 0 and h > 0:
+                crop = centered_crop(w, h, ratio)
+            else:
+                continue
+            new = c.transform.with_crop(crop)
+            if new != c.transform:
+                c.transform = new
+                changed = True
+        if changed:
+            self.changed.emit()
+        return changed

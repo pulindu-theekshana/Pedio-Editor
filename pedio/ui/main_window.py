@@ -2,12 +2,14 @@ import os
 from functools import partial
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtWidgets import (QFileDialog, QMainWindow, QMessageBox,
-                               QSplitter, QVBoxLayout, QWidget)
+from PySide6.QtGui import QCursor, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QFileDialog, QMainWindow, QMenu, QMessageBox,
+                               QSplitter, QStackedWidget, QVBoxLayout, QWidget)
 
 from pedio.core.clips import Project
+from pedio.core.transform import ASPECT_PRESETS
 from pedio.core.workers import ProbeWorker
+from pedio.ui.crop_editor import CropEditor
 from pedio.ui.export_dialog import ExportDialog
 from pedio.ui.player import VIDEO_EXTS, PlayerWidget
 from pedio.ui.timeline import TimelinePanel
@@ -35,12 +37,20 @@ class MainWindow(QMainWindow):
         self.preview = PlayerWidget()
         self.preview.load_failed.connect(self.on_load_failed)
 
+        # crop editor: takes the place of the preview while the crop box is open (Video > Crop)
+        self.crop_editor = CropEditor()
+        self.crop_editor.applied.connect(self.on_crop_applied)
+        self.crop_editor.cancelled.connect(self.close_crop_editor)
+        self.top = QStackedWidget()
+        self.top.addWidget(self.preview)
+        self.top.addWidget(self.crop_editor)
+
         # timeline area (ruler, clips, playhead, zoom, trim handles, drag to reorder)
         self.timeline = TimelinePanel(self.preview, self.project)
         self.project.changed.connect(self.on_project_changed)   # connected after the timeline's own handlers
 
         splitter = QSplitter(Qt.Vertical)
-        splitter.addWidget(self.preview)
+        splitter.addWidget(self.top)
         splitter.addWidget(self.timeline)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
@@ -57,6 +67,9 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Delete), self, activated=self.delete_clip)
         QShortcut(QKeySequence(Qt.Key.Key_BracketLeft), self, activated=self.trim_start_to_playhead)
         QShortcut(QKeySequence(Qt.Key.Key_BracketRight), self, activated=self.trim_end_to_playhead)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.crop_shortcut_cancel)
+        QShortcut(QKeySequence(Qt.Key.Key_Return), self, activated=self.crop_shortcut_done)
+        QShortcut(QKeySequence(Qt.Key.Key_Enter), self, activated=self.crop_shortcut_done)
         self.statusBar().showMessage("Ready")
 
     # ---- import (several files are added one after another at the end of the timeline)
@@ -88,8 +101,8 @@ class MainWindow(QMainWindow):
             self._probe = None
         self._probe_next()
 
-    def on_probe_done(self, path, duration):
-        self.project.add_clip(path, duration)
+    def on_probe_done(self, path, duration, width, height, rotation):
+        self.project.add_clip(path, duration, (width, height), rotation)
         self.statusBar().showMessage(f"Added {os.path.basename(path)} ({duration:.1f} s)")
 
     def on_probe_failed(self, path, message):
@@ -111,7 +124,12 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(f"{count} clips - Pedio Editor")
 
     # ---- editing
+    def crop_open(self):
+        return self.top.currentWidget() is self.crop_editor
+
     def split_at_playhead(self):
+        if self.crop_open():
+            return
         if self.project.split(self.timeline.position()):
             self.statusBar().showMessage("Split at the playhead")
         else:
@@ -125,6 +143,8 @@ class MainWindow(QMainWindow):
         return self.project.clips[i] if i >= 0 else None
 
     def delete_clip(self):
+        if self.crop_open():
+            return
         clip = self._target_clip()
         if clip is None:
             self.statusBar().showMessage("Select a clip first (click it on the timeline)")
@@ -133,6 +153,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Deleted {os.path.basename(clip.path)} ({clip.length:.1f} s)")
 
     def trim_start_to_playhead(self):
+        if self.crop_open():
+            return
         start = self.project.trim_start_at(self.timeline.position())
         if start is None:
             self.statusBar().showMessage("Move the playhead inside a clip to trim its start")
@@ -141,10 +163,88 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Trimmed the start of the clip")
 
     def trim_end_to_playhead(self):
+        if self.crop_open():
+            return
         if self.project.trim_end_at(self.timeline.position()) is None:
             self.statusBar().showMessage("Move the playhead inside a clip to trim its end")
         else:
             self.statusBar().showMessage("Trimmed the end of the clip")
+
+    # ---- picture: rotate, flip, aspect ratio, crop (the clip's Transform, see core/transform.py)
+    def rotate_clip(self):
+        clip = self._target_clip()
+        if clip is None:
+            self.statusBar().showMessage("Select a clip first (click it on the timeline)")
+        elif self.project.rotate(clip.id):
+            self.statusBar().showMessage("Rotated the clip 90 degrees clockwise")
+
+    def flip_clip(self, horizontal):
+        clip = self._target_clip()
+        if clip is None:
+            self.statusBar().showMessage("Select a clip first (click it on the timeline)")
+        elif self.project.flip(clip.id, horizontal):
+            self.statusBar().showMessage("Flipped the clip " + ("left-right" if horizontal else "top-bottom"))
+
+    def choose_aspect(self):
+        """Video > Aspect Ratio: a list of ratios under the mouse. The choice is applied to every clip."""
+        if not self.project.clips:
+            self.statusBar().showMessage("Import a video first")
+            return
+        menu = QMenu(self)
+        menu.addAction("Original (no crop)").setData("")
+        menu.addSeparator()
+        for name in ASPECT_PRESETS:
+            menu.addAction(name).setData(name)
+        action = menu.exec(QCursor.pos())
+        if action is not None:
+            self.set_aspect(action.data())
+
+    def set_aspect(self, name):
+        """name = a key of ASPECT_PRESETS, or "" for no crop. Every clip gets a centered crop with that ratio."""
+        if self.project.set_aspect_all(ASPECT_PRESETS.get(name)):
+            self.statusBar().showMessage(
+                f"Aspect ratio {name} applied to all clips. Use Crop to move the box on a clip" if name
+                else "Crops removed from all clips")
+        else:
+            self.statusBar().showMessage("Nothing changed")
+
+    def start_crop(self):
+        """Video > Crop: the preview turns into the crop editor for the selected clip (or the one under the playhead)."""
+        if self.crop_open():
+            return
+        clip = self._target_clip()
+        if clip is None:
+            self.statusBar().showMessage("Select a clip first (click it on the timeline)")
+            return
+        i, offset = self.project.clip_at(self.timeline.position())
+        inside = i >= 0 and self.project.clips[i] is clip
+        self.preview.pause()
+        self.crop_editor.start(clip, clip.src_in + (offset if inside else clip.length / 2))
+        self.top.setCurrentWidget(self.crop_editor)
+        self.toolbar.setEnabled(False)
+        self.timeline.setEnabled(False)
+        self.statusBar().showMessage("Crop: set the box, then click Done (Enter). Cancel = Esc")
+
+    def close_crop_editor(self):
+        self.top.setCurrentWidget(self.preview)
+        self.toolbar.setEnabled(True)
+        self.timeline.setEnabled(True)
+        self.preview.refresh()
+        self.statusBar().showMessage("Ready")
+
+    def on_crop_applied(self, rect):
+        clip_id = self.crop_editor.clip_id
+        self.close_crop_editor()
+        if self.project.set_crop(clip_id, rect):
+            self.statusBar().showMessage("Cropped the clip" if rect else "Crop removed from the clip")
+
+    def crop_shortcut_cancel(self):
+        if self.crop_open():
+            self.close_crop_editor()
+
+    def crop_shortcut_done(self):
+        if self.crop_open() and self.crop_editor.done_btn.isEnabled():
+            self.crop_editor.done_btn.click()
 
     # ---- export (the same clip list the player plays)
     def export_video(self):
@@ -198,6 +298,11 @@ class MainWindow(QMainWindow):
             "Trim End": self.trim_end_to_playhead,
             "Split": self.split_at_playhead,
             "Delete": self.delete_clip,
+            "Crop": self.start_crop,
+            "Aspect Ratio": self.choose_aspect,
+            "Rotate": self.rotate_clip,
+            "Flip H": lambda: self.flip_clip(True),
+            "Flip V": lambda: self.flip_clip(False),
             "Export Video": self.export_video,
         }
         action = actions.get(tool)
@@ -210,6 +315,7 @@ class MainWindow(QMainWindow):
         self._queue.clear()
         if self._probe is not None:
             self._probe.wait(3000)
+        self.crop_editor.shutdown()
         self.timeline.shutdown()
         self.preview.shutdown()
         super().closeEvent(event)
