@@ -10,7 +10,7 @@ from array import array
 from collections import namedtuple
 
 from PySide6.QtCore import QLine, QPoint, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap, QPolygon
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap, QPolygon, QTransform
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton, QScrollBar,
                                QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget)
 
@@ -55,12 +55,28 @@ def ruler_label(t, with_tenths):
     return f"{text}.{frac}" if with_tenths else text
 
 
+def look_pixmap(pixmap, transform):
+    """A thumbnail as the preview shows the clip: mirrored, turned, then cropped (same order as core/transform.py).
+    The result is TRACK_H pixels tall."""
+    image = pixmap.toImage()
+    if transform.flip:
+        image = image.mirrored(True, False)
+    if transform.rotate:
+        image = image.transformed(QTransform().rotate(transform.rotate), Qt.TransformationMode.SmoothTransformation)
+    if transform.crop:
+        x, y, w, h = transform.crop
+        iw, ih = image.width(), image.height()
+        image = image.copy(round(iw * x), round(ih * y), max(1, round(iw * w)), max(1, round(ih * h)))
+    return QPixmap.fromImage(image.scaledToHeight(TRACK_H, Qt.TransformationMode.SmoothTransformation))
+
+
 class Media:
     """What the timeline knows about one source file: thumbnails and audio peaks (shared by all its clips)."""
 
     def __init__(self, path, duration):
         self.path = path
         self.duration = duration
+        self.looks = {}           # (thumbnail index, Transform) -> thumbnail after flip / rotate / crop
         self.thumbs = []
         self.thumbs_done = False
         self.thumb_step = thumb_step(duration)
@@ -567,6 +583,17 @@ class TimelineView(QWidget):
                 p.drawText(xi + 3, 12, ruler_label(t, major < 1))
             k += 1
 
+    @staticmethod
+    def _look(media, index, transform):
+        """media.thumbs[index] after the clip's flip / rotate / crop (cached per picture + transform)."""
+        key = (index, transform)
+        pixmap = media.looks.get(key)
+        if pixmap is None:
+            if len(media.looks) > 800:               # old looks of earlier edits
+                media.looks.clear()
+            pixmap = media.looks[key] = look_pixmap(media.thumbs[index], transform)
+        return pixmap
+
     def _paint_video_clip(self, p, y, s, x0, x1, w):
         left, right = max(x0, 0.0), min(x1, float(w))
         if right <= left:
@@ -575,7 +602,13 @@ class TimelineView(QWidget):
         media = self.media.get(s.clip.path)
         if media is None or not media.thumbs:
             return
+        transform = s.clip.transform                # flip / rotate / crop: the thumbnails show what the preview shows
         tile = media.thumb_w or 128
+        if not transform.is_default:
+            first = next((n for n, pm in enumerate(media.thumbs) if pm is not None), None)
+            if first is None:
+                return
+            tile = self._look(media, first, transform).width()
         i = max(0, int((left - x0) // tile))
         while True:
             x = x0 + i * tile                       # tiles start at the left edge of the clip
@@ -585,6 +618,8 @@ class TimelineView(QWidget):
             if index >= len(media.thumbs):          # not made (yet): reuse the last one only when finished
                 index = len(media.thumbs) - 1 if media.thumbs_done else -1
             pixmap = media.thumbs[index] if index >= 0 else None
+            if pixmap is not None and not transform.is_default:
+                pixmap = self._look(media, index, transform)
             if pixmap is not None:
                 dx0, dx1 = max(x, left), min(x + tile, right, x + pixmap.width())
                 if dx1 > dx0:
