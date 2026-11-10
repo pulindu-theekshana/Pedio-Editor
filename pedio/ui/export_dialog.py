@@ -10,7 +10,7 @@ from pedio.core.export import ExportWorker
 
 
 class ExportDialog(QDialog):
-    def __init__(self, clips, out_path, settings=None, parent=None, audio_clips=None):
+    def __init__(self, clips, out_path, settings=None, parent=None, audio_clips=None, text_layers=None):
         super().__init__(parent)
         self.setWindowTitle("Export")
         self.setModal(True)
@@ -36,7 +36,8 @@ class ExportDialog(QDialog):
         root.addWidget(self.bar)
         root.addLayout(buttons)
 
-        self.worker = ExportWorker(clips, out_path, settings, self, audio_clips=audio_clips)
+        self.worker = ExportWorker(clips, out_path, settings, self, audio_clips=audio_clips,
+                                   text_layers=text_layers)
         self.worker.progress.connect(self.on_progress)
         self.worker.done.connect(self.on_done)
         self.worker.failed.connect(self.on_failed)

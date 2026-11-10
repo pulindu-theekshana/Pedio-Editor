@@ -5,6 +5,7 @@ player plays, so what you see in the preview is what you get in the file.
 """
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, replace
@@ -14,6 +15,7 @@ from PySide6.QtCore import QThread, Signal
 
 from pedio.core.audio import AudioClip
 from pedio.core.clips import Segment
+from pedio.core.layers import TextLayer, build_ass
 from pedio.core.transform import output_size, stream_rotation, video_filters
 from pedio.core.workers import CREATE_NO_WINDOW
 from pedio.paths import find_tool
@@ -137,7 +139,7 @@ def _segment_audio_fades(seg):
 
 
 # ---------------------------------------------------------------------- command
-def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=()):
+def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=(), text_layers=(), ass_name=None):
     """The ffmpeg command line. clips = [Segment] (3-tuples work too), sources = {path: SourceInfo}.
 
     Every clip is cut with input seeking (-ss / -t), mirrored / rotated / cropped (video_filters, the same
@@ -145,6 +147,8 @@ def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=()):
     concat filter. A clip without sound gets silence of the same length.
     The output size is the size of the first clip after its transform; the other clips are fitted into it.
     Extra audio clips are placed at their timeline start and mixed over the video's original sound.
+    Text layers are drawn by the `ass` filter from a file the worker writes (`ass_name`, relative to its cwd);
+    the same ASS file is shown by the preview.
     """
     clips = [Segment(*c) for c in clips]
     audio_clips = _active_audio_clips(_copy_audio_clips(audio_clips), sum(c.length for c in clips))
@@ -172,6 +176,10 @@ def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=()):
         parts.append(f"{audio},atrim=duration={length:.6f},asetpts=PTS-STARTPTS{_segment_audio_fades(seg)}[a{i}]")
         joined += f"[v{i}][a{i}]"
     parts.append(f"{joined}concat=n={len(clips)}:v=1:a=1[v][basea]")
+    video_out = "[v]"
+    if ass_name and text_layers:
+        parts.append(f"[v]ass={ass_name}[vtext]")
+        video_out = "[vtext]"
 
     if audio_clips:
         mixed = "[basea]"
@@ -185,7 +193,7 @@ def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=()):
         parts.append("[basea]anull[a]")
 
     cmd += [
-        "-filter_complex", ";".join(parts), "-map", "[v]", "-map", "[a]",
+        "-filter_complex", ";".join(parts), "-map", video_out, "-map", "[a]",
         "-c:v", "libx264", "-preset", settings.preset, "-crf", str(settings.crf), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", settings.audio_bitrate,
         "-movflags", "+faststart", "-f", "mp4",
@@ -246,10 +254,12 @@ class ExportWorker(QThread):
     failed = Signal(str)         # message for the user
     cancelled = Signal()
 
-    def __init__(self, clips, out_path, settings=None, parent=None, audio_clips=None):
+    def __init__(self, clips, out_path, settings=None, parent=None, audio_clips=None, text_layers=None):
         super().__init__(parent)
         self.clips = [Segment(*c) for c in clips]     # copy: later edits do not change a running export
         self.audio_clips = _copy_audio_clips(audio_clips or [])
+        self.text_layers = [layer.copy() if isinstance(layer, TextLayer) else TextLayer(*layer)
+                            for layer in (text_layers or [])]
         self.out_path = out_path
         self.settings = settings or ExportSettings()
         self._stop = False
@@ -265,7 +275,7 @@ class ExportWorker(QThread):
                 pass
 
     def run(self):
-        part = self.out_path + ".part"
+        part = os.path.abspath(self.out_path) + ".part"
         try:
             self._export(part)
         except ExportError as e:
@@ -298,20 +308,35 @@ class ExportWorker(QThread):
                     return self._cancel(part)
                 probe_audio(clip.path)
 
-        cmd = build_command(ffmpeg, self.clips, sources, part, self.settings, audio_clips)
-        with tempfile.TemporaryFile() as errors:      # a file, so ffmpeg can never block on a full pipe
-            self._proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=errors, stdin=subprocess.DEVNULL,
-                text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
-            if self._stop:
-                self._proc.kill()
-            for line in self._proc.stdout:
-                t = _out_time(line)
-                if t is not None and total > 0:
-                    self.progress.emit(min(max(t / total, 0.0), 1.0))
-            code = self._proc.wait()
-            errors.seek(0)
-            message = errors.read().decode("utf-8", "replace").strip()
+        ass_dir = None
+        ass_name = None
+        if self.text_layers:
+            # A bare file name (relative to ffmpeg's cwd) keeps ':' and '\' of Windows paths out of the
+            # filter graph. The preview shows the same kind of ASS file.
+            ass_dir = tempfile.mkdtemp(prefix="pedio_text_")
+            ass_name = "text.ass"
+            with open(os.path.join(ass_dir, ass_name), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(build_ass(self.text_layers))
+        try:
+            cmd = build_command(ffmpeg, self.clips, sources, part, self.settings, audio_clips,
+                                self.text_layers, ass_name)
+            with tempfile.TemporaryFile() as errors:  # a file, so ffmpeg can never block on a full pipe
+                self._proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=errors, stdin=subprocess.DEVNULL,
+                    text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW,
+                    cwd=ass_dir)
+                if self._stop:
+                    self._proc.kill()
+                for line in self._proc.stdout:
+                    t = _out_time(line)
+                    if t is not None and total > 0:
+                        self.progress.emit(min(max(t / total, 0.0), 1.0))
+                code = self._proc.wait()
+                errors.seek(0)
+                message = errors.read().decode("utf-8", "replace").strip()
+        finally:
+            if ass_dir:
+                shutil.rmtree(ass_dir, ignore_errors=True)
 
         if self._stop:
             return self._cancel(part)

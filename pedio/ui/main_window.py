@@ -2,19 +2,22 @@ import os
 import tempfile
 from functools import partial
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QFileDialog, QMainWindow, QMenu, QMessageBox,
                                QSplitter, QStackedWidget, QVBoxLayout, QWidget)
 
 from pedio.core.clips import Project
 from pedio.core.export import AudioMixWorker
+from pedio.core.layers import build_ass
 from pedio.core.transform import ASPECT_PRESETS
 from pedio.core.workers import AudioProbeWorker, ProbeWorker
 from pedio.ui.crop_editor import CropEditor
 from pedio.ui.export_dialog import ExportDialog
+from pedio.ui.overlay_view import TextOverlay
 from pedio.ui.panels.audio_panel import AudioPanel
 from pedio.ui.panels.fade_panel import FadePanel
+from pedio.ui.panels.text_panel import TextPanel
 from pedio.ui.player import AUDIO_EXTS, VIDEO_EXTS, PlayerWidget
 from pedio.ui.timeline import TimelinePanel
 from pedio.ui.toolbar import BottomToolbar
@@ -42,6 +45,9 @@ class MainWindow(QMainWindow):
         self._mix_timer.timeout.connect(self._start_audio_mix)
         self.audio_panel = None        # created on first use
         self.fade_panel = None         # created on first use
+        self.text_panel = None         # created on first use
+        self._text_ass = ""            # temp ASS file the player shows as subtitles
+        self._text_sig = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -52,6 +58,12 @@ class MainWindow(QMainWindow):
         # preview area (mpv plays the whole timeline: all clips one after another)
         self.preview = PlayerWidget()
         self.preview.load_failed.connect(self.on_load_failed)
+
+        # text drag layer, on top of mpv's video widget
+        self.text_overlay = TextOverlay(self.preview.video)
+        self.text_overlay.set_project(self.project)
+        self.text_overlay.committed.connect(self.move_text_layer)
+        self.preview.video.installEventFilter(self)
 
         # crop editor: takes the place of the preview while the crop box is open (Video > Crop)
         self.crop_editor = CropEditor()
@@ -196,6 +208,47 @@ class MainWindow(QMainWindow):
         self.fade_panel.raise_()
         self.fade_panel.activateWindow()
 
+    def open_text_panel(self):
+        """Text > Add Text / Edit Text: write the text, pick size / colours / outline / shadow."""
+        if self.text_panel is None:
+            self.text_panel = TextPanel(self.project, self)
+        self.text_panel.refresh()
+        self.text_panel.show()
+        self.text_panel.raise_()
+        self.text_panel.activateWindow()
+
+    def add_text(self):
+        """Add a 3-second text layer at the playhead and open its panel."""
+        start = round(self.timeline.position(), 2)
+        layer = self.project.add_text_layer("Text", start, start + 3.0)
+        self.project.select_text(layer.id)
+        self.open_text_panel()
+
+    def edit_text(self):
+        """Open the panel for the selected text; if none is selected, use the one at the playhead."""
+        if not self.project.selected_text_id:
+            t = self.timeline.position()
+            layer = next((item for item in self.project.text_layers
+                          if item.start <= t < item.end), None)
+            if layer is None and self.project.text_layers:
+                layer = self.project.text_layers[0]
+            if layer is None:
+                self.add_text()
+                return
+            self.project.select_text(layer.id)
+        self.open_text_panel()
+
+    def move_text_layer(self, x, y):
+        layer = self.project.text_by_id(self.project.selected_text_id)
+        if layer is not None:
+            self.project.update_text_layer(layer.id, x=x, y=y)
+
+    def eventFilter(self, obj, event):
+        if obj is self.preview.video and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            self.text_overlay.setGeometry(self.preview.video.rect())
+            self.text_overlay.refresh()
+        return super().eventFilter(obj, event)
+
     def toggle_audio_mute(self):
         clip = self.project.audio_by_id(self.project.selected_audio_id)
         if clip is None:
@@ -211,6 +264,7 @@ class MainWindow(QMainWindow):
 
     def on_project_changed(self):
         """Any edit: give the player the new clip list (it keeps the playhead position)."""
+        self._update_text_preview()
         self.preview.set_edit_list(self.project.play_list(), self.timeline.position())
         count = len(self.project.clips)
         if count == 0:
@@ -220,6 +274,35 @@ class MainWindow(QMainWindow):
         else:
             self.setWindowTitle(f"{count} clips - Pedio Editor")
         self._schedule_audio_mix()
+
+    # ---- preview text: one temporary ASS file, drawn by mpv (the export uses the same kind of file)
+    @staticmethod
+    def _text_signature(layers):
+        return tuple((layer.id, layer.text, round(layer.start, 3), round(layer.end, 3),
+                      round(layer.x, 4), round(layer.y, 4), layer.size, layer.color,
+                      layer.outline, layer.outline_color, layer.shadow, layer.shadow_color)
+                     for layer in layers)
+
+    def _update_text_preview(self):
+        signature = self._text_signature(self.project.text_layers)
+        if signature == self._text_sig:
+            return
+        self._text_sig = signature
+        old, path = self._text_ass, ""
+        try:
+            fd, path = tempfile.mkstemp(prefix="pedio_text_", suffix=".ass")
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(build_ass(self.project.text_layers))
+        except OSError as e:
+            print(f"[text] could not write the preview text: {e}")
+            return
+        self._text_ass = path
+        self.preview.set_subtitles(path)
+        if old and old != path:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
 
     # ---- preview sound: one temporary mix of the video sound + the audio clips
     def _audio_signature(self):
@@ -432,7 +515,8 @@ class MainWindow(QMainWindow):
         if any(os.path.normcase(os.path.abspath(c[0])) == same for c in clips):
             QMessageBox.warning(self, "Export", "This file is used by the edit. Choose another file name.")
             return
-        dialog = ExportDialog(clips, path, parent=self, audio_clips=self.project.audio_clips)
+        dialog = ExportDialog(clips, path, parent=self, audio_clips=self.project.audio_clips,
+                              text_layers=self.project.text_layers)
         dialog.exec()
         if dialog.succeeded:
             self.statusBar().showMessage(f"Exported {os.path.basename(path)}")
@@ -493,6 +577,8 @@ class MainWindow(QMainWindow):
             "Fade In/Out": self.open_audio_panel,
             "Fade In": self.open_fade_panel,
             "Fade Out": self.open_fade_panel,
+            "Add Text": self.add_text,
+            "Edit Text": self.edit_text,
             "Export Video": self.export_video,
         }
         action = actions.get(tool)
@@ -514,6 +600,8 @@ class MainWindow(QMainWindow):
             self._mix_worker.wait(3000)
         if self._mix_path:
             self._remove_file(self._mix_path)
+        if self._text_ass:
+            self._remove_file(self._text_ass)
         self.crop_editor.shutdown()
         self.timeline.shutdown()
         self.preview.shutdown()

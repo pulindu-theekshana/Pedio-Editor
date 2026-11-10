@@ -23,7 +23,8 @@ GAP = 4
 VIDEO_TRACK_Y = RULER_H + GAP
 AUDIO_TRACK_Y = VIDEO_TRACK_Y + TRACK_H + GAP
 CLIP_TRACK_Y = AUDIO_TRACK_Y + TRACK_H + GAP
-VIEW_H = CLIP_TRACK_Y + TRACK_H
+TEXT_TRACK_Y = CLIP_TRACK_Y + TRACK_H + GAP
+VIEW_H = TEXT_TRACK_Y + TRACK_H
 HEADER_W = 104
 MAX_PPS = 300.0   # most zoomed-in: 300 pixels per second
 HANDLE_W = 8      # trim handle width in pixels (inside the clip edge)
@@ -38,6 +39,7 @@ TRACK_BG = QColor("#262626")
 VIDEO_BG = QColor("#33404d")
 AUDIO_BG = QColor("#26332a")
 CLIP_BG = QColor("#2d3340")
+TEXT_BG = QColor("#3a2f3d")
 CLIP_WAVE = QColor("#6fa8ff")
 WAVE = QColor("#58c26b")
 WAVE_MUTED = QColor("#6c6c6c")
@@ -381,6 +383,14 @@ class TimelineView(QWidget):
                 return clip
         return None
 
+    def _text_hit(self, x):
+        """The text layer under x on the text lane, or None."""
+        for layer in reversed(self.project.text_layers):
+            x0, x1 = self.time_to_x(layer.start), self.time_to_x(layer.end)
+            if x0 <= x < x1:
+                return layer
+        return None
+
     def _audio_start(self, clip):
         """Timeline start of an audio clip, including the preview position while it is dragged."""
         if self._audio_preview is not None and self._audio_preview[0] == clip.id:
@@ -436,7 +446,14 @@ class TimelineView(QWidget):
             self._mode = "audio"
             self._audio_move = [audio.id, audio.start, x]
             return
-        if y >= CLIP_TRACK_Y + TRACK_H:       # empty space below the tracks
+        if TEXT_TRACK_Y <= y < TEXT_TRACK_Y + TRACK_H:      # text layers
+            layer = self._text_hit(x)
+            if layer is not None:
+                self.project.select_text(layer.id)
+            else:
+                self.project.clear_selection()
+            return
+        if y >= TEXT_TRACK_Y + TRACK_H:       # empty space below the tracks
             self.project.clear_selection()
             return
         part, i = self._hit(x)
@@ -458,6 +475,10 @@ class TimelineView(QWidget):
     def mouseMoveEvent(self, event):
         x, y = event.position().x(), event.position().y()
         if self._mode is None:
+            if TEXT_TRACK_Y <= y < TEXT_TRACK_Y + TRACK_H:
+                self.setCursor(Qt.CursorShape.PointingHandCursor
+                               if self._text_hit(x) is not None else Qt.CursorShape.ArrowCursor)
+                return
             if CLIP_TRACK_Y <= y < CLIP_TRACK_Y + TRACK_H:
                 if self._audio_hit(x) is not None:
                     self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -634,14 +655,14 @@ class TimelineView(QWidget):
                 p.drawPolygon(QPolygon([QPoint(x - 7, 0), QPoint(x + 7, 0), QPoint(x, 12)]))
 
     def _paint_content(self, p, w):
-        video_y, audio_y, clip_y = VIDEO_TRACK_Y, AUDIO_TRACK_Y, CLIP_TRACK_Y
+        video_y, audio_y, clip_y, text_y = VIDEO_TRACK_Y, AUDIO_TRACK_Y, CLIP_TRACK_Y, TEXT_TRACK_Y
         p.setFont(self._font)
         p.fillRect(0, 0, w, RULER_H, RULER_BG)
-        for y in (video_y, audio_y, clip_y):
+        for y in (video_y, audio_y, clip_y, text_y):
             p.fillRect(0, y, w, TRACK_H, TRACK_BG)
-        if not self.project.clips and not self.project.audio_clips:
+        if not self.project.clips and not self.project.audio_clips and not self.project.text_layers:
             p.setPen(LABEL)
-            p.drawText(QRect(0, video_y, w, TRACK_H * 3 + GAP * 2), Qt.AlignmentFlag.AlignCenter,
+            p.drawText(QRect(0, video_y, w, TRACK_H * 4 + GAP * 3), Qt.AlignmentFlag.AlignCenter,
                        "Import a video to see the timeline")
             return
         self._paint_ruler(p, w)
@@ -663,6 +684,10 @@ class TimelineView(QWidget):
             x0, x1 = self.time_to_x(start), self.time_to_x(start + clip.length)
             if x1 >= 0 and x0 <= w:
                 self._paint_extra_audio(p, clip_y, clip, x0, x1, w)
+        for layer in self.project.text_layers:
+            x0, x1 = self.time_to_x(layer.start), self.time_to_x(layer.end)
+            if x1 >= 0 and x0 <= w:
+                self._paint_text_layer(p, text_y, layer, x0, x1, w)
 
     def _paint_ruler(self, p, w):
         major, divisions = next(((m, d) for m, d in TICKS if m * self.pps >= 90), TICKS[-1])
@@ -805,6 +830,29 @@ class TimelineView(QWidget):
             p.setPen(QPen(SELECT, 2))
             p.drawRect(QRect(int(round(x0)) + 1, y + 1, int(round(x1)) - int(round(x0)) - 2, TRACK_H - 2))
 
+    def _paint_text_layer(self, p, y, layer, x0, x1, w):
+        """One text layer on the text lane: its text and time range."""
+        left, right = max(x0, 0.0), min(x1, float(w))
+        if right <= left:
+            return
+        area = QRect(int(left), y, int(right) - int(left), TRACK_H)
+        p.fillRect(area, TEXT_BG)
+        p.setPen(QColor(0, 0, 0, 200))
+        for x in (int(round(x0)), int(round(x1))):
+            p.drawLine(x, y, x, y + TRACK_H)
+        text = " ".join(str(layer.text).split()) or "(empty text)"
+        avail = int(right - left) - 10
+        if avail > 24:
+            text = self._fm.elidedText(text, Qt.TextElideMode.ElideRight, avail)
+            p.setPen(LABEL)
+            p.drawText(QRect(int(left) + 5, y, avail, TRACK_H),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+        if layer.id == self.project.selected_text_id:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(SELECT, 2))
+            p.drawRect(QRect(int(round(x0)) + 1, y + 1,
+                             int(round(x1)) - int(round(x0)) - 2, TRACK_H - 2))
+
     def _paint_fades(self, p, s, x0, x1, vy):
         """Show the fade to / from black as dark wedges at the clip ends."""
         length = max(s.t1 - s.t0, 1e-6)
@@ -907,6 +955,8 @@ class TimelinePanel(QWidget):
         hl.addWidget(audio_head)
         hl.addSpacing(GAP)
         hl.addWidget(self._track_header("Audio clips"))
+        hl.addSpacing(GAP)
+        hl.addWidget(self._track_header("Text"))
 
         body = QHBoxLayout()
         body.setSpacing(0)

@@ -6,6 +6,7 @@ from typing import NamedTuple
 from PySide6.QtCore import QObject, Signal
 
 from pedio.core.audio import AudioClip
+from pedio.core.layers import TextLayer, normalize_color
 from pedio.core.transform import Transform, centered_crop
 
 MIN_CLIP = 0.1  # shortest clip allowed, in seconds
@@ -58,8 +59,10 @@ class Project(QObject):
         super().__init__(parent)
         self.clips = []
         self.audio_clips = []
+        self.text_layers = []
         self.selected_id = 0        # 0 = no video clip selected
         self.selected_audio_id = 0  # 0 = no audio clip selected
+        self.selected_text_id = 0   # 0 = no text layer selected
 
     # ------------------------------------------------------------------ reading
     def total(self):
@@ -123,11 +126,24 @@ class Project(QObject):
         return self.audio_clips[i] if i >= 0 else None
 
     def extent(self):
-        """Length of the whole edit, including audio clips that reach past the last video clip."""
+        """Length of the whole edit, including audio / text that reach past the last video clip."""
         end = self.total()
         for c in self.audio_clips:
             end = max(end, c.end)
+        for layer in self.text_layers:
+            end = max(end, layer.end)
         return end
+
+    # ------------------------------------------------------------------ text layers
+    def text_index_of(self, layer_id):
+        for i, layer in enumerate(self.text_layers):
+            if layer.id == layer_id:
+                return i
+        return -1
+
+    def text_by_id(self, layer_id):
+        i = self.text_index_of(layer_id)
+        return self.text_layers[i] if i >= 0 else None
 
     # ------------------------------------------------------------------ selection
     def select(self, clip_id):
@@ -136,6 +152,7 @@ class Project(QObject):
         if clip_id != self.selected_id:
             self.selected_id = clip_id
             self.selected_audio_id = 0
+            self.selected_text_id = 0
             self.selection_changed.emit()
 
     def select_audio(self, audio_id):
@@ -144,12 +161,23 @@ class Project(QObject):
         if audio_id != self.selected_audio_id:
             self.selected_audio_id = audio_id
             self.selected_id = 0
+            self.selected_text_id = 0
+            self.selection_changed.emit()
+
+    def select_text(self, layer_id):
+        if layer_id and self.text_index_of(layer_id) < 0:
+            layer_id = 0
+        if layer_id != self.selected_text_id:
+            self.selected_text_id = layer_id
+            self.selected_id = 0
+            self.selected_audio_id = 0
             self.selection_changed.emit()
 
     def clear_selection(self):
-        if self.selected_id or self.selected_audio_id:
+        if self.selected_id or self.selected_audio_id or self.selected_text_id:
             self.selected_id = 0
             self.selected_audio_id = 0
+            self.selected_text_id = 0
             self.selection_changed.emit()
 
     # ------------------------------------------------------------------ edits (each returns True if something changed)
@@ -175,6 +203,68 @@ class Project(QObject):
         if self.selected_audio_id == audio_id:
             self.selected_audio_id = 0
             self.selection_changed.emit()
+        self.changed.emit()
+        return True
+
+    def add_text_layer(self, text="Text", start=0.0, end=None, x=0.5, y=0.5, size=64,
+                       color="#ffffff", outline=3, outline_color="#000000", shadow=2,
+                       shadow_color="#000000"):
+        """Add a text overlay over the timeline. end defaults to start + 3 s."""
+        start = max(float(start), 0.0)
+        end = start + 3.0 if end is None else float(end)
+        layer = TextLayer(str(text), start, max(end, start + MIN_CLIP), float(x), float(y),
+                          int(size), normalize_color(color), int(outline),
+                          normalize_color(outline_color), int(shadow),
+                          normalize_color(shadow_color))
+        self.text_layers.append(layer)
+        self.changed.emit()
+        return layer
+
+    def remove_text_layer(self, layer_id):
+        i = self.text_index_of(layer_id)
+        if i < 0:
+            return False
+        del self.text_layers[i]
+        if self.selected_text_id == layer_id:
+            self.selected_text_id = 0
+            self.selection_changed.emit()
+        self.changed.emit()
+        return True
+
+    def update_text_layer(self, layer_id, **changes):
+        """Change any TextLayer field by name (text, start, end, x, y, size, colours, ...)."""
+        layer = self.text_by_id(layer_id)
+        if layer is None:
+            return False
+        updates = {name: value for name, value in changes.items()
+                   if name in TextLayer.__dataclass_fields__ and name != "id"}
+        if "text" in updates:
+            updates["text"] = str(updates["text"])
+        if "start" in updates:
+            updates["start"] = max(float(updates["start"]), 0.0)
+        if "end" in updates:
+            updates["end"] = float(updates["end"])
+        start = updates.get("start", layer.start)
+        end = updates.get("end", layer.end)
+        if end < start + MIN_CLIP:
+            end = start + MIN_CLIP
+            if "end" in updates or "start" in updates:
+                updates["end"] = end
+        for name in ("x", "y"):
+            if name in updates:
+                updates[name] = min(max(float(updates[name]), 0.0), 1.0)
+        if "size" in updates:
+            updates["size"] = min(max(int(updates["size"]), 8), 400)
+        for name in ("outline", "shadow"):
+            if name in updates:
+                updates[name] = min(max(int(updates[name]), 0), 40)
+        for name in ("color", "outline_color", "shadow_color"):
+            if name in updates:
+                updates[name] = normalize_color(updates[name])
+        if all(getattr(layer, name) == value for name, value in updates.items()):
+            return False
+        for name, value in updates.items():
+            setattr(layer, name, value)
         self.changed.emit()
         return True
 

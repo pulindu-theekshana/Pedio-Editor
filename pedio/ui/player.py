@@ -122,6 +122,7 @@ class PlayerWidget(QWidget):
         self._last_path = ""
         self._segments = []          # the last edit list given to set_edit_list
         self._audio_mix = ""         # external audio file (whole timeline mix) that mpv should play
+        self._subtitles = ""         # generated ASS file with the timeline's text layers
         self._sources = []           # what mpv has loaded: [(path, start, length)]
         self._looks = []             # [(end_time, (transform, meta_rotation))]: how each part of the timeline is shown
         self._applied_look = None    # the look mpv's filters are set to now
@@ -292,6 +293,11 @@ class PlayerWidget(QWidget):
                 self.player.audio_file = self._audio_mix
             except Exception as e:
                 print(f"[player] could not set the audio mix: {e}")
+        if self._subtitles:     # the text layers, drawn by mpv like a normal external subtitle
+            try:
+                self.player.sub_file = self._subtitles
+            except Exception as e:
+                print(f"[player] could not set the text layers: {e}")
         total = sum(n for _p, _s, n in sources)
         if self._settling:  # reloaded again before the last reload finished: keep its "resume" choice
             was_playing = self._resume
@@ -330,6 +336,19 @@ class PlayerWidget(QWidget):
 
     def audio_mix_path(self):
         return self._audio_mix
+
+    def set_subtitles(self, path):
+        """Draw these text layers (an ASS file written by the text panel) over the video. Reloads at the current
+        position when the file actually changed."""
+        path = path or ""
+        if path == self._subtitles:
+            return
+        self._subtitles = path
+        if self.player is None or not self._sources or not self._segments:
+            return
+        segments, position = list(self._segments), self.position()
+        self._sources = []                 # force set_edit_list to load the list again
+        self.set_edit_list(segments, position)
 
     def _look_at(self, t):
         ends = [end for end, _look in self._looks]

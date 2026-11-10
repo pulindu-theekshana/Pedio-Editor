@@ -28,9 +28,9 @@ Tested on Windows: preview, export and timeline thumbnails match. Fixed on the w
 - [x] 8b Preview fade + 0.1-2 s slider. Files: ui/player.py, ui/panels/
 
 ## Step 9 - Text overlay
-- [ ] 9a Layer model, no UI: core/layers.py (TextLayer: text, size, color, shadow, outline size/color, start/end, x/y; image layers reuse it in Step 13) + export (drawtext)
-- [ ] 9b Text on the preview + drag to position. Files: ui/player.py, ui/overlay_view.py
-- [ ] 9c Text panel (size, color, shadow, outline) + text lane on the timeline for start/end. Files: ui/panels/text_panel.py, ui/timeline.py
+- [x] 9a Layer model, no UI: core/layers.py (TextLayer: text, size, color, shadow, outline size/color, start/end, x/y; image layers reuse it in Step 13) + export (ASS file, shared with the preview)
+- [x] 9b Text on the preview + drag to position. Files: ui/player.py, ui/overlay_view.py
+- [x] 9c Text panel (size, color, shadow, outline) + text lane on the timeline for start/end. Files: ui/panels/text_panel.py, ui/timeline.py
 
 ## Step 10 - Speed + export settings
 - [ ] 10a Clip speed: data + preview + export (setpts / atempo)
