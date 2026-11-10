@@ -20,7 +20,10 @@ from pedio.core.workers import PEAKS_PER_SECOND, ThumbnailWorker, WaveformWorker
 RULER_H = 28
 TRACK_H = 72
 GAP = 4
-VIEW_H = RULER_H + GAP + TRACK_H + GAP + TRACK_H
+VIDEO_TRACK_Y = RULER_H + GAP
+AUDIO_TRACK_Y = VIDEO_TRACK_Y + TRACK_H + GAP
+CLIP_TRACK_Y = AUDIO_TRACK_Y + TRACK_H + GAP
+VIEW_H = CLIP_TRACK_Y + TRACK_H
 HEADER_W = 104
 MAX_PPS = 300.0   # most zoomed-in: 300 pixels per second
 HANDLE_W = 8      # trim handle width in pixels (inside the clip edge)
@@ -34,6 +37,8 @@ LABEL = QColor("#c8c8c8")
 TRACK_BG = QColor("#262626")
 VIDEO_BG = QColor("#33404d")
 AUDIO_BG = QColor("#26332a")
+CLIP_BG = QColor("#2d3340")
+CLIP_WAVE = QColor("#6fa8ff")
 WAVE = QColor("#58c26b")
 WAVE_MUTED = QColor("#6c6c6c")
 PLAYHEAD = QColor("#ff4d4d")
@@ -115,6 +120,8 @@ class TimelineView(QWidget):
         self._drop_index = -1     # reorder: where the clip would land
         self._ghost = None        # reorder: (x, width) of the clip following the mouse
         self._trim = None         # trim: [clip id, "l" | "r", new source in / out]
+        self._audio_move = None   # [audio clip id, original start, press x]
+        self._audio_preview = None  # (audio clip id, start) while dragging an audio clip
         self._snap_t = None       # time of the snap line being shown
         self._ignore_until = 0.0
         self._cache = None
@@ -133,7 +140,7 @@ class TimelineView(QWidget):
 
     @property
     def duration(self):
-        return self.project.total()
+        return self.project.extent()
 
     # ------------------------------------------------------------------ data
     def _on_project_changed(self):
@@ -366,6 +373,51 @@ class TimelineView(QWidget):
                 return "body", i
         return None, -1
 
+    def _audio_hit(self, x):
+        """The audio clip under x on the audio-clip lane, or None."""
+        for clip in reversed(self.project.audio_clips):
+            x0, x1 = self.time_to_x(self._audio_start(clip)), self.time_to_x(self._audio_start(clip) + clip.length)
+            if x0 <= x < x1:
+                return clip
+        return None
+
+    def _audio_start(self, clip):
+        """Timeline start of an audio clip, including the preview position while it is dragged."""
+        if self._audio_preview is not None and self._audio_preview[0] == clip.id:
+            return self._audio_preview[1]
+        return clip.start
+
+    def _snap_audio(self, start, clip):
+        """Snap the start (or the end) of an audio clip being dragged to the playhead, video edges or other clips."""
+        self._snap_t = None
+        if not self.snap_enabled or self.pps <= 0:
+            return start
+        length = clip.length
+        best, dist = start, SNAP_PX / self.pps
+        points = [0.0, self.position] + self.project.boundaries()
+        for other in self.project.audio_clips:
+            if other.id != clip.id:
+                points += [other.start, other.end]
+        for t in points:
+            d = abs(t - start)
+            if d < dist:
+                best, dist = t, d
+            d = abs(t - (start + length))
+            if d < dist:
+                best, dist = t - length, d
+        best = max(best, 0.0)
+        if abs(best - start) > 1e-9:
+            self._snap_t = self._snap_point(best, length, points)
+        return best
+
+    @staticmethod
+    def _snap_point(start, length, points):
+        """The snap line time to draw for a snapped start: whichever edge (start or end) is on a point."""
+        for t in points:
+            if abs(t - start) < 1e-6 or abs(t - (start + length)) < 1e-6:
+                return t
+        return start
+
     # ------------------------------------------------------------------ mouse
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton or self.duration <= 0:
@@ -375,9 +427,21 @@ class TimelineView(QWidget):
             self._mode = "scrub"
             self._seek_to_x(x, exact=False, snap=True)
             return
+        if CLIP_TRACK_Y <= y < CLIP_TRACK_Y + TRACK_H:      # extra audio clips
+            audio = self._audio_hit(x)
+            if audio is None:
+                self.project.clear_selection()
+                return
+            self.project.select_audio(audio.id)
+            self._mode = "audio"
+            self._audio_move = [audio.id, audio.start, x]
+            return
+        if y >= CLIP_TRACK_Y + TRACK_H:       # empty space below the tracks
+            self.project.clear_selection()
+            return
         part, i = self._hit(x)
         if i < 0:                             # empty space: deselect
-            self.project.select(0)
+            self.project.clear_selection()
             return
         clip = self.project.clips[i]
         self.project.select(clip.id)
@@ -394,6 +458,12 @@ class TimelineView(QWidget):
     def mouseMoveEvent(self, event):
         x, y = event.position().x(), event.position().y()
         if self._mode is None:
+            if CLIP_TRACK_Y <= y < CLIP_TRACK_Y + TRACK_H:
+                if self._audio_hit(x) is not None:
+                    self.setCursor(Qt.CursorShape.OpenHandCursor)
+                else:
+                    self.unsetCursor()
+                return
             part, _ = self._hit(x) if y >= RULER_H else (None, -1)
             if part in ("l", "r"):
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
@@ -416,6 +486,8 @@ class TimelineView(QWidget):
             self._reorder_to(x)
         elif self._mode == "trim":
             self._trim_to(x)
+        elif self._mode == "audio":
+            self._audio_move_to(x)
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton or self._mode is None:
@@ -428,9 +500,13 @@ class TimelineView(QWidget):
             self._finish_reorder()
         elif mode == "trim":
             self._finish_trim()
+        elif mode == "audio":
+            self._finish_audio_move()
         self._snap_t = None
         self._ghost = None
         self._trim = None
+        self._audio_move = None
+        self._audio_preview = None
         self._drop_index = -1
         self._press_index = -1
         self._ignore_until = time.monotonic() + 0.15  # let the player catch up before following it again
@@ -483,6 +559,23 @@ class TimelineView(QWidget):
             self.project.trim_start(clip_id, value)
         else:
             self.project.trim_end(clip_id, value)
+
+    def _audio_move_to(self, x):
+        clip_id, start, press_x = self._audio_move
+        clip = self.project.audio_by_id(clip_id)
+        if clip is None:
+            return
+        new_start = max(0.0, start + (x - press_x) / self.pps)
+        new_start = self._snap_audio(new_start, clip)
+        if self._audio_preview != (clip_id, new_start):
+            self._audio_preview = (clip_id, new_start)
+            self._invalidate()
+
+    def _finish_audio_move(self):
+        if self._audio_preview is not None:
+            clip_id, start = self._audio_preview
+            self._audio_preview = None
+            self.project.move_audio_clip(clip_id, start)
 
     def wheelEvent(self, event):
         if self.duration <= 0:
@@ -541,28 +634,33 @@ class TimelineView(QWidget):
                 p.drawPolygon(QPolygon([QPoint(x - 7, 0), QPoint(x + 7, 0), QPoint(x, 12)]))
 
     def _paint_content(self, p, w):
-        video_y = RULER_H + GAP
-        audio_y = video_y + TRACK_H + GAP
+        video_y, audio_y, clip_y = VIDEO_TRACK_Y, AUDIO_TRACK_Y, CLIP_TRACK_Y
         p.setFont(self._font)
         p.fillRect(0, 0, w, RULER_H, RULER_BG)
-        p.fillRect(0, video_y, w, TRACK_H, TRACK_BG)
-        p.fillRect(0, audio_y, w, TRACK_H, TRACK_BG)
-        if not self.project.clips:
+        for y in (video_y, audio_y, clip_y):
+            p.fillRect(0, y, w, TRACK_H, TRACK_BG)
+        if not self.project.clips and not self.project.audio_clips:
             p.setPen(LABEL)
-            p.drawText(QRect(0, video_y, w, TRACK_H * 2 + GAP), Qt.AlignmentFlag.AlignCenter,
+            p.drawText(QRect(0, video_y, w, TRACK_H * 3 + GAP * 2), Qt.AlignmentFlag.AlignCenter,
                        "Import a video to see the timeline")
             return
         self._paint_ruler(p, w)
-        slots = self._layout()
-        active = self._trim[0] if self._mode == "trim" and self._trim else 0
-        slots = [s for s in slots if s.clip.id != active] + [s for s in slots if s.clip.id == active]  # trimmed clip on top
-        for s in slots:
-            x0, x1 = self.time_to_x(s.t0), self.time_to_x(s.t1)
-            if x1 < 0 or x0 > w:
-                continue
-            self._paint_video_clip(p, video_y, s, x0, x1, w)
-            self._paint_audio_clip(p, audio_y, s, x0, x1, w)
-            self._paint_frame(p, s, x0, x1, w, video_y, audio_y)
+        if self.project.clips:
+            slots = self._layout()
+            active = self._trim[0] if self._mode == "trim" and self._trim else 0
+            slots = [s for s in slots if s.clip.id != active] + [s for s in slots if s.clip.id == active]  # trimmed clip on top
+            for s in slots:
+                x0, x1 = self.time_to_x(s.t0), self.time_to_x(s.t1)
+                if x1 < 0 or x0 > w:
+                    continue
+                self._paint_video_clip(p, video_y, s, x0, x1, w)
+                self._paint_audio_clip(p, audio_y, s, x0, x1, w)
+                self._paint_frame(p, s, x0, x1, w, video_y, audio_y)
+        for clip in self.project.audio_clips:
+            start = self._audio_start(clip)
+            x0, x1 = self.time_to_x(start), self.time_to_x(start + clip.length)
+            if x1 >= 0 and x0 <= w:
+                self._paint_extra_audio(p, clip_y, clip, x0, x1, w)
 
     def _paint_ruler(self, p, w):
         major, divisions = next(((m, d) for m, d in TICKS if m * self.pps >= 90), TICKS[-1])
@@ -660,6 +758,51 @@ class TimelineView(QWidget):
         p.setPen(QPen(WAVE_MUTED if self.muted else WAVE, 1))
         p.drawLines(lines)
 
+    def _paint_extra_audio(self, p, y, clip, x0, x1, w):
+        """One imported sound clip on the audio-clip lane (waveform from its source range)."""
+        left, right = max(x0, 0.0), min(x1, float(w))
+        if right <= left:
+            return
+        area = QRect(int(left), y, int(right) - int(left), TRACK_H)
+        p.fillRect(area, CLIP_BG if not clip.mute else QColor("#2a2a2a"))
+        p.setPen(QColor(0, 0, 0, 200))
+        for x in (int(round(x0)), int(round(x1))):
+            p.drawLine(x, y, x, y + TRACK_H)
+        media = self.media.get(clip.path)
+        if media is not None and media.mins:
+            mid = y + TRACK_H / 2
+            scale = (TRACK_H / 2 - 4) / 32768
+            lines = []
+            for x in range(int(left), int(right)):
+                first = int((clip.src_in + (x - x0) / self.pps) * PEAKS_PER_SECOND)
+                if first < 0:
+                    continue
+                if first >= len(media.mins):
+                    break
+                last = max(first + 1, int((clip.src_in + (x + 1 - x0) / self.pps) * PEAKS_PER_SECOND))
+                top = int(mid - max(media.maxs[first:last]) * scale)
+                bottom = int(mid - min(media.mins[first:last]) * scale)
+                lines.append(QLine(x, top, x, max(bottom, top + 1)))
+            p.setPen(QPen(WAVE_MUTED if clip.mute else CLIP_WAVE, 1))
+            p.drawLines(lines)
+        else:
+            p.setPen(LABEL)
+            p.drawText(area, Qt.AlignmentFlag.AlignCenter,
+                       "No audio" if media is not None and media.audio_state is False else "Reading audio ...")
+        avail = int(right - left) - 8
+        if avail > 40:
+            text = os.path.basename(clip.path)
+            text = self._fm.elidedText(text, Qt.TextElideMode.ElideRight, avail)
+            lx = int(left) + 4
+            p.fillRect(QRect(lx, y + 3, self._fm.horizontalAdvance(text) + 8, 15), QColor(0, 0, 0, 150))
+            p.setPen(LABEL)
+            p.drawText(QRect(lx + 4, y + 3, avail, 15),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+        if clip.id == self.project.selected_audio_id:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(SELECT, 2))
+            p.drawRect(QRect(int(round(x0)) + 1, y + 1, int(round(x1)) - int(round(x0)) - 2, TRACK_H - 2))
+
     def _paint_frame(self, p, s, x0, x1, w, vy, ay):
         """Clip border, name + length, and (for the selected clip) the outline and trim handles."""
         xi0, xi1 = int(round(x0)), int(round(x1))
@@ -745,6 +888,8 @@ class TimelinePanel(QWidget):
         self.mute_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         audio_head.layout().addWidget(self.mute_btn)
         hl.addWidget(audio_head)
+        hl.addSpacing(GAP)
+        hl.addWidget(self._track_header("Audio clips"))
 
         body = QHBoxLayout()
         body.setSpacing(0)
@@ -813,18 +958,25 @@ class TimelinePanel(QWidget):
         for clip in self.project.clips:
             if clip.path not in self.view.media:
                 self._start_media(clip.path, clip.src_duration)
+        for clip in self.project.audio_clips:      # a sound file (or a video used for its sound) needs a waveform
+            if clip.path not in self.view.media:
+                self._start_waveform(clip.path, clip.src_out)
 
     def _start_media(self, path, duration):
         media = self.view.add_media(path, duration)
         thumbs = ThumbnailWorker(path, duration, media.thumb_step, TRACK_H, self)
-        wave = WaveformWorker(path, self)
         self._workers[thumbs] = path
-        self._workers[wave] = path
         thumbs.thumb_ready.connect(self._on_thumb)
         thumbs.finished.connect(self._on_thumbs_finished)
+        thumbs.start()
+        self._start_waveform(path, duration, media)
+
+    def _start_waveform(self, path, duration, media=None):
+        media = media or self.view.add_media(path, duration)
+        wave = WaveformWorker(path, self)
+        self._workers[wave] = path
         wave.chunk_ready.connect(self._on_peaks)
         wave.audio_done.connect(self._on_audio_done)
-        thumbs.start()
         wave.start()
 
     # the sender is the worker; it tells us which file the data belongs to

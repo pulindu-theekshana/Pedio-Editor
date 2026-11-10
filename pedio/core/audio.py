@@ -15,6 +15,8 @@ class AudioClip:
     src_out: float
     volume: float = 1.0
     mute: bool = False
+    fade_in: float = 0.0     # seconds of fade in at the clip start (0 .. 2)
+    fade_out: float = 0.0    # seconds of fade out at the clip end (0 .. 2)
     id: int = field(default_factory=lambda: next(_next_id))
 
     @property

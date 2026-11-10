@@ -22,6 +22,10 @@ VIDEO_EXTS = {
     ".mpg", ".mpeg", ".ts", ".mts", ".m2ts", ".3gp", ".ogv",
 }
 
+AUDIO_EXTS = {
+    ".mp3", ".wav", ".aac", ".m4a", ".flac", ".ogg", ".oga", ".opus", ".wma", ".aiff", ".aif",
+}
+
 END_FILE_ERROR = 4  # mpv "end-file" reason: the file could not be played
 
 
@@ -114,6 +118,8 @@ class PlayerWidget(QWidget):
         self._duration = 0.0
         self._muted = False
         self._last_path = ""
+        self._segments = []          # the last edit list given to set_edit_list
+        self._audio_mix = ""         # external audio file (whole timeline mix) that mpv should play
         self._sources = []           # what mpv has loaded: [(path, start, length)]
         self._looks = []             # [(end_time, (transform, meta_rotation))]: how each part of the timeline is shown
         self._applied_look = None    # the look mpv's filters are set to now
@@ -265,6 +271,8 @@ class PlayerWidget(QWidget):
         """Play these Segments one after another. After a reload the player goes back to `position` (timeline
         seconds) and keeps playing if it was. If only a transform changed (rotate / flip / crop) nothing is
         reloaded: the video filters are changed on the fly."""
+        segments = list(segments)
+        self._segments = segments
         sources = merge_sources(segments)
         self._looks = look_schedule(segments)
         if sources == self._sources:
@@ -277,6 +285,11 @@ class PlayerWidget(QWidget):
         if not self._ensure_player():
             self._sources = []
             return
+        if self._audio_mix:     # the whole-timeline sound mix beats the files' own sound (it includes it)
+            try:
+                self.player.audio_file = self._audio_mix
+            except Exception as e:
+                print(f"[player] could not set the audio mix: {e}")
         total = sum(n for _p, _s, n in sources)
         if self._settling:  # reloaded again before the last reload finished: keep its "resume" choice
             was_playing = self._resume
@@ -299,6 +312,22 @@ class PlayerWidget(QWidget):
         """Draw the current picture again (after the video widget was hidden and shown)."""
         if self.player is not None and self._has_file and self._seek_after_load is None:
             self.player.command("seek", f"{self.position():.3f}", "absolute+exact")
+
+    def set_audio_mix(self, path):
+        """Use this file as the whole timeline's sound (an ffmpeg mix of the video sound + audio clips).
+        Reloads the playlist at the current position so mpv switches tracks cleanly."""
+        path = path or ""
+        if path == self._audio_mix:
+            return
+        self._audio_mix = path
+        if self.player is None or not self._sources or not self._segments:
+            return
+        segments, position = list(self._segments), self.position()
+        self._sources = []                 # force set_edit_list to load the list again
+        self.set_edit_list(segments, position)
+
+    def audio_mix_path(self):
+        return self._audio_mix
 
     def _look_at(self, t):
         ends = [end for end, _look in self._looks]

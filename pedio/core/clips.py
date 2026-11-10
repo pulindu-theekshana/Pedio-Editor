@@ -54,7 +54,8 @@ class Project(QObject):
         super().__init__(parent)
         self.clips = []
         self.audio_clips = []
-        self.selected_id = 0      # 0 = nothing selected
+        self.selected_id = 0        # 0 = no video clip selected
+        self.selected_audio_id = 0  # 0 = no audio clip selected
 
     # ------------------------------------------------------------------ reading
     def total(self):
@@ -104,12 +105,45 @@ class Project(QObject):
                 out.append(Segment(c.path, c.src_in, c.length, c.transform, c.meta_rotation))
         return out
 
+    # ------------------------------------------------------------------ audio reading
+    def audio_index_of(self, audio_id):
+        for i, c in enumerate(self.audio_clips):
+            if c.id == audio_id:
+                return i
+        return -1
+
+    def audio_by_id(self, audio_id):
+        i = self.audio_index_of(audio_id)
+        return self.audio_clips[i] if i >= 0 else None
+
+    def extent(self):
+        """Length of the whole edit, including audio clips that reach past the last video clip."""
+        end = self.total()
+        for c in self.audio_clips:
+            end = max(end, c.end)
+        return end
+
     # ------------------------------------------------------------------ selection
     def select(self, clip_id):
         if clip_id and self.index_of(clip_id) < 0:
             clip_id = 0
         if clip_id != self.selected_id:
             self.selected_id = clip_id
+            self.selected_audio_id = 0
+            self.selection_changed.emit()
+
+    def select_audio(self, audio_id):
+        if audio_id and self.audio_index_of(audio_id) < 0:
+            audio_id = 0
+        if audio_id != self.selected_audio_id:
+            self.selected_audio_id = audio_id
+            self.selected_id = 0
+            self.selection_changed.emit()
+
+    def clear_selection(self):
+        if self.selected_id or self.selected_audio_id:
+            self.selected_id = 0
+            self.selected_audio_id = 0
             self.selection_changed.emit()
 
     # ------------------------------------------------------------------ edits (each returns True if something changed)
@@ -128,12 +162,60 @@ class Project(QObject):
 
     def remove_audio_clip(self, audio_id):
         """Remove an audio clip by id. Returns True when a clip was removed."""
-        for i, clip in enumerate(self.audio_clips):
-            if clip.id == audio_id:
-                del self.audio_clips[i]
-                self.changed.emit()
-                return True
-        return False
+        i = self.audio_index_of(audio_id)
+        if i < 0:
+            return False
+        del self.audio_clips[i]
+        if self.selected_audio_id == audio_id:
+            self.selected_audio_id = 0
+            self.selection_changed.emit()
+        self.changed.emit()
+        return True
+
+    def move_audio_clip(self, audio_id, start):
+        """Put an audio clip at a new timeline start (seconds). Can be negative-free: 0 is the left edge."""
+        clip = self.audio_by_id(audio_id)
+        if clip is None:
+            return False
+        start = max(0.0, float(start))
+        if abs(start - clip.start) < 1e-6:
+            return False
+        clip.start = start
+        self.changed.emit()
+        return True
+
+    def set_audio_volume(self, audio_id, volume):
+        clip = self.audio_by_id(audio_id)
+        if clip is None:
+            return False
+        volume = min(max(float(volume), 0.0), 2.0)
+        if abs(volume - clip.volume) < 1e-6:
+            return False
+        clip.volume = volume
+        self.changed.emit()
+        return True
+
+    def set_audio_mute(self, audio_id, mute):
+        clip = self.audio_by_id(audio_id)
+        if clip is None or clip.mute == bool(mute):
+            return False
+        clip.mute = bool(mute)
+        self.changed.emit()
+        return True
+
+    def set_audio_fades(self, audio_id, fade_in, fade_out):
+        """Fade in / out at the clip ends, 0 .. min(2 s, half the clip)."""
+        clip = self.audio_by_id(audio_id)
+        if clip is None:
+            return False
+        top = min(2.0, clip.length / 2)
+        fade_in = min(max(float(fade_in), 0.0), top)
+        fade_out = min(max(float(fade_out), 0.0), top)
+        if abs(fade_in - clip.fade_in) < 1e-6 and abs(fade_out - clip.fade_out) < 1e-6:
+            return False
+        clip.fade_in, clip.fade_out = fade_in, fade_out
+        self.changed.emit()
+        return True
 
     def split(self, t):
         """Cut the clip under timeline time t in two. Both halves keep the clip's transform (and any later per-clip effect)."""

@@ -1,17 +1,20 @@
 import os
+import tempfile
 from functools import partial
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QFileDialog, QMainWindow, QMenu, QMessageBox,
                                QSplitter, QStackedWidget, QVBoxLayout, QWidget)
 
 from pedio.core.clips import Project
+from pedio.core.export import AudioMixWorker
 from pedio.core.transform import ASPECT_PRESETS
-from pedio.core.workers import ProbeWorker
+from pedio.core.workers import AudioProbeWorker, ProbeWorker
 from pedio.ui.crop_editor import CropEditor
 from pedio.ui.export_dialog import ExportDialog
-from pedio.ui.player import VIDEO_EXTS, PlayerWidget
+from pedio.ui.panels.audio_panel import AudioPanel
+from pedio.ui.player import AUDIO_EXTS, VIDEO_EXTS, PlayerWidget
 from pedio.ui.timeline import TimelinePanel
 from pedio.ui.toolbar import BottomToolbar
 
@@ -26,6 +29,17 @@ class MainWindow(QMainWindow):
         self.project = Project(self)   # the clips on the timeline
         self._queue = []               # files waiting to be read (imported one after another, in order)
         self._probe = None             # the ProbeWorker that is running now
+        self._audio_queue = []         # (path, timeline start, src_in, src_out or None) waiting for the audio probe
+        self._audio_probe = None       # the AudioProbeWorker that is running now
+        self._mix_worker = None        # AudioMixWorker: builds the preview's sound file
+        self._mix_generation = 0
+        self._mix_path = ""
+        self._mix_signature = None
+        self._mix_timer = QTimer(self)  # debounce: one mix build after a burst of edits
+        self._mix_timer.setSingleShot(True)
+        self._mix_timer.setInterval(500)
+        self._mix_timer.timeout.connect(self._start_audio_mix)
+        self.audio_panel = None        # created on first use
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -108,6 +122,78 @@ class MainWindow(QMainWindow):
     def on_probe_failed(self, path, message):
         self.on_load_failed(message)
 
+    # ---- audio import (Add Audio) and extracting the sound of a video clip
+    def import_audio(self):
+        patterns = " ".join(f"*{ext}" for ext in sorted(AUDIO_EXTS))
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add audio", "", f"Audio files ({patterns});;All files (*.*)")
+        self.load_audio(paths)
+
+    def load_audio(self, paths):
+        start = self.timeline.position()
+        for path in paths:
+            self._audio_queue.append((path, start, 0.0, None))
+        self._probe_audio_next()
+
+    def extract_audio(self):
+        """Put the sound of the selected video clip on the audio lane as its own clip."""
+        clip = self._target_clip()
+        if clip is None:
+            self.statusBar().showMessage("Select a video clip first (click it on the timeline)")
+            return
+        i = self.project.index_of(clip.id)
+        self._audio_queue.append((clip.path, self.project.starts()[i], clip.src_in, clip.src_out))
+        self._probe_audio_next()
+
+    def _probe_audio_next(self):
+        if self._audio_probe is not None or not self._audio_queue:
+            return
+        path, start, src_in, src_out = self._audio_queue.pop(0)
+        self.statusBar().showMessage(f"Reading the sound of {os.path.basename(path)} ...")
+        worker = AudioProbeWorker(path, self)
+        worker.done.connect(partial(self.on_audio_probe_done, start, src_in, src_out))
+        worker.failed.connect(self.on_audio_probe_failed)
+        worker.finished.connect(partial(self._audio_probe_finished, worker))
+        self._audio_probe = worker
+        worker.start()
+
+    def _audio_probe_finished(self, worker):
+        worker.deleteLater()
+        if self._audio_probe is worker:
+            self._audio_probe = None
+        self._probe_audio_next()
+
+    def on_audio_probe_done(self, start, src_in, src_out, path, duration, has_audio):
+        end = duration if src_out is None else min(src_out, duration)
+        src_in = min(max(src_in, 0.0), max(end - 0.1, 0.0))
+        if end - src_in < 0.1:
+            self.statusBar().showMessage(f"{os.path.basename(path)} is too short to use")
+            return
+        self.project.add_audio_clip(path, start, src_in, end)
+        self.statusBar().showMessage(f"Added sound {os.path.basename(path)} ({end - src_in:.1f} s)")
+
+    def on_audio_probe_failed(self, path, message):
+        self.statusBar().showMessage(message)
+        QMessageBox.warning(self, "Audio", message)
+
+    def open_audio_panel(self):
+        """Audio > Volume / Fade In-Out: edit the selected audio clip."""
+        if self.audio_panel is None:
+            self.audio_panel = AudioPanel(self.project, self)
+        self.audio_panel.refresh()
+        self.audio_panel.show()
+        self.audio_panel.raise_()
+        self.audio_panel.activateWindow()
+
+    def toggle_audio_mute(self):
+        clip = self.project.audio_by_id(self.project.selected_audio_id)
+        if clip is None:
+            self.statusBar().showMessage("Select an audio clip first (click it on the audio-clips lane)")
+            return
+        muted = not clip.mute
+        self.project.set_audio_mute(clip.id, muted)
+        self.statusBar().showMessage("Muted the sound" if muted else "Unmuted the sound")
+
     def on_load_failed(self, message):
         self.statusBar().showMessage(message)
         QMessageBox.warning(self, "Import failed", message)
@@ -122,6 +208,73 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(f"{os.path.basename(self.project.clips[0].path)} - Pedio Editor")
         else:
             self.setWindowTitle(f"{count} clips - Pedio Editor")
+        self._schedule_audio_mix()
+
+    # ---- preview sound: one temporary mix of the video sound + the audio clips
+    def _audio_signature(self):
+        clips = tuple((c.path, round(c.src_in, 3), round(c.length, 3)) for c in self.project.play_list())
+        extra = tuple((c.path, round(c.start, 3), round(c.src_in, 3), round(c.length, 3),
+                       round(c.volume, 3), c.mute, round(c.fade_in, 3), round(c.fade_out, 3))
+                      for c in self.project.audio_clips)
+        return clips, extra
+
+    def _schedule_audio_mix(self):
+        """After an edit, rebuild the preview's sound once the edits stop for a moment."""
+        if not self.project.clips:
+            self.preview.set_audio_mix("")
+            self._mix_signature = None
+            return
+        signature = self._audio_signature()
+        if signature == self._mix_signature and self._mix_path:
+            return
+        self._mix_signature = signature
+        self._mix_timer.start()
+
+    def _start_audio_mix(self):
+        if not self.project.clips:
+            return
+        self._mix_generation += 1
+        path = os.path.join(tempfile.gettempdir(), f"pedio_mix_{os.getpid()}_{self._mix_generation}.m4a")
+        old = self._mix_worker
+        if old is not None and old.isRunning():
+            old.stop()
+            old.wait(3000)
+        worker = AudioMixWorker(self.project.play_list(), self.project.audio_clips, path,
+                                self._mix_generation, self)
+        worker.ready.connect(self._on_mix_ready)
+        worker.failed.connect(self._on_mix_failed)
+        worker.finished.connect(self._on_mix_worker_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._mix_worker = worker
+        worker.start()
+
+    def _on_mix_worker_finished(self):
+        if self.sender() is self._mix_worker:
+            self._mix_worker = None
+
+    def _on_mix_ready(self, generation, path):
+        if generation != self._mix_generation:
+            self._remove_file(path)
+            return
+        old = self._mix_path
+        self._mix_path = path
+        self.preview.set_audio_mix(path)
+        if old and old != path:
+            self._remove_file(old)
+
+    def _on_mix_failed(self, generation, message):
+        if generation != self._mix_generation:
+            return
+        self._mix_signature = None        # try again after the next edit
+        if self.project.audio_clips:
+            self.statusBar().showMessage(f"Preview sound: {message}")
+
+    @staticmethod
+    def _remove_file(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
     # ---- editing
     def crop_open(self):
@@ -144,6 +297,11 @@ class MainWindow(QMainWindow):
 
     def delete_clip(self):
         if self.crop_open():
+            return
+        audio = self.project.audio_by_id(self.project.selected_audio_id)
+        if audio is not None:
+            self.project.remove_audio_clip(audio.id)
+            self.statusBar().showMessage(f"Removed sound {os.path.basename(audio.path)}")
             return
         clip = self._target_clip()
         if clip is None:
@@ -263,7 +421,7 @@ class MainWindow(QMainWindow):
         if any(os.path.normcase(os.path.abspath(c[0])) == same for c in clips):
             QMessageBox.warning(self, "Export", "This file is used by the edit. Choose another file name.")
             return
-        dialog = ExportDialog(clips, path, parent=self)
+        dialog = ExportDialog(clips, path, parent=self, audio_clips=self.project.audio_clips)
         dialog.exec()
         if dialog.succeeded:
             self.statusBar().showMessage(f"Exported {os.path.basename(path)}")
@@ -280,15 +438,29 @@ class MainWindow(QMainWindow):
                     paths.append(path)
         return paths
 
+    @staticmethod
+    def dropped_audio(mime):
+        paths = []
+        for url in mime.urls():
+            if url.isLocalFile():
+                path = url.toLocalFile()
+                if os.path.splitext(path)[1].lower() in AUDIO_EXTS:
+                    paths.append(path)
+        return paths
+
     def dragEnterEvent(self, event):
-        if self.dropped_videos(event.mimeData()):
+        if self.dropped_videos(event.mimeData()) or self.dropped_audio(event.mimeData()):
             event.acceptProposedAction()
 
     def dropEvent(self, event):
-        paths = self.dropped_videos(event.mimeData())
-        if paths:
+        videos = self.dropped_videos(event.mimeData())
+        audio = self.dropped_audio(event.mimeData())
+        if videos or audio:
             event.acceptProposedAction()
-            self.load_videos(paths)
+        if videos:
+            self.load_videos(videos)
+        if audio:
+            self.load_audio(audio)
 
     # ---- toolbar
     def on_tool(self, category, tool):
@@ -303,6 +475,11 @@ class MainWindow(QMainWindow):
             "Rotate": self.rotate_clip,
             "Flip H": lambda: self.flip_clip(True),
             "Flip V": lambda: self.flip_clip(False),
+            "Add Audio": self.import_audio,
+            "Extract Audio": self.extract_audio,
+            "Volume": self.open_audio_panel,
+            "Mute": self.toggle_audio_mute,
+            "Fade In/Out": self.open_audio_panel,
             "Export Video": self.export_video,
         }
         action = actions.get(tool)
@@ -313,8 +490,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._queue.clear()
+        self._audio_queue.clear()
         if self._probe is not None:
             self._probe.wait(3000)
+        if self._audio_probe is not None:
+            self._audio_probe.wait(3000)
+        self._mix_timer.stop()
+        if self._mix_worker is not None and self._mix_worker.isRunning():
+            self._mix_worker.stop()
+            self._mix_worker.wait(3000)
+        if self._mix_path:
+            self._remove_file(self._mix_path)
         self.crop_editor.shutdown()
         self.timeline.shutdown()
         self.preview.shutdown()

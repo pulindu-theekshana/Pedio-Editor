@@ -104,6 +104,18 @@ def _active_audio_clips(audio_clips, duration):
             and clip.length > 0 and clip.start < duration]
 
 
+def _extra_audio_filter(clip):
+    """Volume + fade in / out for one AudioClip, before it is delayed and mixed."""
+    chain = (f"aresample={AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,"
+             f"atrim=duration={clip.length:.6f},asetpts=PTS-STARTPTS,volume={clip.volume:.6f}")
+    if clip.fade_in > 0:
+        chain += f",afade=t=in:st=0:d={min(clip.fade_in, clip.length):.6f}"
+    if clip.fade_out > 0:
+        start = max(clip.length - clip.fade_out, 0.0)
+        chain += f",afade=t=out:st={start:.6f}:d={min(clip.fade_out, clip.length):.6f}"
+    return chain
+
+
 # ---------------------------------------------------------------------- command
 def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=()):
     """The ffmpeg command line. clips = [Segment] (3-tuples work too), sources = {path: SourceInfo}.
@@ -145,10 +157,7 @@ def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=()):
         for i, clip in enumerate(audio_clips, start=len(clips)):
             cmd += ["-ss", f"{clip.src_in:.6f}", "-t", f"{clip.length:.6f}", "-i", clip.path]
             delay_ms = max(0, round(clip.start * 1000))
-            parts.append(
-                f"[{i}:a:0]aresample={AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,"
-                f"atrim=duration={clip.length:.6f},asetpts=PTS-STARTPTS,volume={clip.volume:.6f},"
-                f"adelay={delay_ms}:all=1[extra{i}]")
+            parts.append(f"[{i}:a:0]{_extra_audio_filter(clip)},adelay={delay_ms}:all=1[extra{i}]")
             mixed += f"[extra{i}]"
         parts.append(f"{mixed}amix=inputs={len(audio_clips) + 1}:duration=first:normalize=0[a]")
     else:
@@ -161,6 +170,36 @@ def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=()):
         "-movflags", "+faststart", "-f", "mp4",
         "-progress", "pipe:1", "-nostats", out_path,
     ]
+    return cmd
+
+
+def build_audio_mix_command(ffmpeg, clips, sources, out_path, audio_clips=()):
+    """Audio-only mix of the whole timeline (video sound + extra audio clips), for the preview player."""
+    clips = [Segment(*c) for c in clips]
+    total = sum(c.length for c in clips)
+    audio_clips = _active_audio_clips(_copy_audio_clips(audio_clips), total)
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+    parts, joined = [], ""
+    for i, seg in enumerate(clips):
+        cmd += ["-ss", f"{seg.start:.6f}", "-t", f"{seg.length:.6f}", "-i", seg.path]
+        if sources[seg.path].has_audio:
+            audio = f"[{i}:a:0]aresample={AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,apad"
+        else:
+            audio = f"anullsrc=r={AUDIO_RATE}:cl=stereo"
+        parts.append(f"{audio},atrim=duration={seg.length:.6f},asetpts=PTS-STARTPTS[a{i}]")
+        joined += f"[a{i}]"
+    parts.append(f"{joined}concat=n={len(clips)}:v=0:a=1[basea]")
+    if audio_clips:
+        mixed = "[basea]"
+        for i, clip in enumerate(audio_clips, start=len(clips)):
+            cmd += ["-ss", f"{clip.src_in:.6f}", "-t", f"{clip.length:.6f}", "-i", clip.path]
+            delay_ms = max(0, round(clip.start * 1000))
+            parts.append(f"[{i}:a:0]{_extra_audio_filter(clip)},adelay={delay_ms}:all=1[extra{i}]")
+            mixed += f"[extra{i}]"
+        parts.append(f"{mixed}amix=inputs={len(audio_clips) + 1}:duration=first:normalize=0[a]")
+    else:
+        parts.append("[basea]anull[a]")
+    cmd += ["-filter_complex", ";".join(parts), "-map", "[a]", "-c:a", "aac", "-b:a", "160k", "-f", "mp4", out_path]
     return cmd
 
 
@@ -271,3 +310,54 @@ class ExportWorker(QThread):
             os.remove(path)
         except OSError:
             pass
+
+
+class AudioMixWorker(QThread):
+    """Builds the preview's audio track (video sound + audio clips) as a small temporary file.
+    `ready` gives back the generation number, so an old job's result can be ignored."""
+
+    ready = Signal(int, str)      # generation, path
+    failed = Signal(int, str)     # generation, message
+
+    def __init__(self, clips, audio_clips, out_path, generation, parent=None):
+        super().__init__(parent)
+        self.clips = [Segment(*c) for c in clips]
+        self.audio_clips = _copy_audio_clips(audio_clips or [])
+        self.out_path = out_path
+        self.generation = generation
+        self._proc = None
+
+    def stop(self):
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def run(self):
+        try:
+            ffmpeg = find_tool("ffmpeg")
+            if not ffmpeg:
+                raise ExportError("ffmpeg was not found. Run setup.bat again.")
+            if not self.clips:
+                raise ExportError("There is nothing to mix.")
+            sources = {}
+            for seg in self.clips:
+                if seg.path not in sources:
+                    sources[seg.path] = probe_source(seg.path)
+            cmd = build_audio_mix_command(ffmpeg, self.clips, sources, self.out_path, self.audio_clips)
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW)
+            _out, err = self._proc.communicate()
+            if self._proc.returncode != 0:
+                message = (err or b"").decode("utf-8", "replace").strip().splitlines()
+                raise ExportError(message[-1] if message else "Could not build the preview audio.")
+            self.ready.emit(self.generation, self.out_path)
+        except Exception as e:
+            try:
+                os.remove(self.out_path)
+            except OSError:
+                pass
+            self.failed.emit(self.generation, str(e))

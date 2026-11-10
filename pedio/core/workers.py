@@ -65,6 +65,45 @@ class ProbeWorker(QThread):
             self.done.emit(self.path, duration, width, height, rotation)
 
 
+class AudioProbeWorker(QThread):
+    """Reads the length and audio track of a sound file (MP3 / WAV / AAC / the audio of a video)."""
+
+    done = Signal(str, float, bool)   # path, duration (s), has an audio stream
+    failed = Signal(str, str)         # path, message
+
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self.path = path
+
+    def run(self):
+        ffprobe = find_tool("ffprobe")
+        if not ffprobe:
+            self.failed.emit(self.path, "ffprobe was not found. Run setup.bat again.")
+            return
+        cmd = [ffprobe, "-v", "error", "-show_format", "-show_streams", "-of", "json", self.path]
+        try:
+            out = subprocess.run(cmd, capture_output=True, timeout=30, creationflags=CREATE_NO_WINDOW)
+            info = json.loads(out.stdout.decode("utf-8", "replace") or "{}")
+            streams = info.get("streams", [])
+            duration = float(info.get("format", {}).get("duration", 0))
+        except Exception:
+            streams, duration = [], 0.0
+        audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+        name = os.path.basename(self.path)
+        if audio is None:
+            self.failed.emit(self.path, f"{name} has no sound track.")
+            return
+        if duration <= 0:
+            try:
+                duration = float(audio.get("duration", 0))
+            except (TypeError, ValueError):
+                duration = 0.0
+        if duration <= 0:
+            self.failed.emit(self.path, f"Could not read the length of {name}.")
+            return
+        self.done.emit(self.path, duration, True)
+
+
 class FrameWorker(QThread):
     """One picture of a clip at `t` seconds with the given filters (mirror / rotate, no crop), at most 720 px tall.
     The crop box is drawn on this picture."""
