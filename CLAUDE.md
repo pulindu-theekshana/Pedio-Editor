@@ -67,6 +67,7 @@ New tool dialogs/panels (crop, audio, text, export settings) -> `pedio/ui/` (a `
 - `setup_paths()` must run before `import mpv` (adds the DLL folder). main.py does this. `player.py` imports mpv lazily.
 - mpv callbacks run on mpv's thread: only emit Qt Signals from them, never touch widgets.
 - mpv `vf=lavfi=[...]` filters (rotate / flip / crop, later fades / text) fail on GPU frames ("Impossible to convert ... src: d3d11"). So the player uses `hwdec="auto-copy-safe"` (copy-back), never plain `auto` / `auto-safe`.
+- Never give a method in a QWidget subclass the name of a Qt method (`rect`, `size`, `update`, `width` ...): it replaces Qt's own and painting then fails silently (black widget).
 - Seek with `player.command("seek", t, "absolute+exact" | "absolute+keyframes")` (keyframes while dragging, exact on release).
 - libmpv needs vulkan-1.dll next to mpv-2.dll (setup_deps.py handles it). Archives with BCJ2 need 7-Zip (not py7zr).
 - ffmpeg jobs run in QThreads with stop(); ignore signals from stale workers (`self.sender()` check).

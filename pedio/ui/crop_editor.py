@@ -71,7 +71,7 @@ class CropView(QWidget):
             self._box = [x, y, x + w, y + h]
         self.update()
 
-    def rect(self):
+    def crop_rect(self):      # not "rect": that name belongs to QWidget (the widget's own rectangle)
         """The box as (x, y, w, h) fractions, or None if it covers the whole picture."""
         x0, y0, x1, y1 = self._box
         return clean_crop((x0, y0, x1 - x0, y1 - y0))
@@ -326,4 +326,4 @@ class CropEditor(QWidget):
         self.view.set_rect(None)
 
     def _done(self):
-        self.applied.emit(self.view.rect())
+        self.applied.emit(self.view.crop_rect())
