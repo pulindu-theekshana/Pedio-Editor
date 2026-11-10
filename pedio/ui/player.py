@@ -47,26 +47,31 @@ def edl_url(segments):
 
 
 def merge_sources(segments):
-    """[Segment] -> [(path, start, length)] for mpv. Pieces that continue each other in the same file are one
-    piece (the transform does not matter here), so changing a transform never reloads the playlist."""
-    out = []
+    """[Segment] -> [(path, start, source_length)] for mpv. Pieces that continue each other in the same file
+    (and the same speed) are one piece, so changing a transform never reloads the playlist."""
+    out, speeds = [], []
     for s in segments:
-        if out and out[-1][0] == s.path and abs(out[-1][1] + out[-1][2] - s.start) < 1e-6:
-            path, start, length = out[-1]
-            out[-1] = (path, start, length + s.length)
+        length = getattr(s, "source_length", s.length)
+        speed = getattr(s, "speed", 1.0)
+        if (out and out[-1][0] == s.path and abs(speeds[-1] - speed) < 1e-9
+                and abs(out[-1][1] + out[-1][2] - s.start) < 1e-6):
+            path, start, old = out[-1]
+            out[-1] = (path, start, old + length)
         else:
-            out.append((s.path, s.start, s.length))
+            out.append((s.path, s.start, length))
+            speeds.append(speed)
     return [(p, round(st, 3), round(n, 3)) for p, st, n in out]
 
 
 def look_schedule(segments):
-    """[(end_time, (transform, meta_rotation, fade_in, fade_out, start, end))] in timeline seconds:
+    """[(end_time, (transform, meta_rotation, fade_in, fade_out, start, end, speed))] in timeline seconds:
     which look is on screen until end_time."""
     out, t = [], 0.0
     for s in segments:
         start = t
         t += s.length
-        out.append((t, (s.transform, s.meta_rotation, s.fade_in, s.fade_out, start, t)))
+        out.append((t, (s.transform, s.meta_rotation, s.fade_in, s.fade_out, start, t,
+                        getattr(s, "speed", 1.0))))
     return out
 
 
@@ -130,6 +135,7 @@ class PlayerWidget(QWidget):
         self._resume = False         # start playing again after the reload
         self._settling = False       # ignore mpv's time updates until the position is restored
         self._generation = 0         # counts reloads, so an old settle timer does not end a newer one
+        self._hwdec = True           # hardware decoding (copy-back, needed by the vf=lavfi filters)
 
         style = self.style()
         self._icon_play = style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
@@ -138,7 +144,7 @@ class PlayerWidget(QWidget):
         self._icon_muted = style.standardIcon(QStyle.StandardPixmap.SP_MediaVolumeMuted)
 
         # --- video area: a hint page, and the native window mpv draws into
-        self.hint = QLabel("Drop a video here\nor click  Video > Import  (Ctrl+O)")
+        self.hint = QLabel("Drop a video here\nor click  Video > Import  (Ctrl+I)")
         self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.hint.setStyleSheet("background:#000; color:#aaa; font-size:18px;")
         self.hint.setMinimumSize(320, 180)
@@ -232,7 +238,7 @@ class PlayerWidget(QWidget):
             )
             # "-copy": the GPU decodes, the frames are copied back to normal memory. Needed for the vf=lavfi filters
             # (rotate / flip / crop): with plain "auto-safe" the frames stay on the GPU (d3d11) and the filter fails.
-            nice_to_have = dict(hwdec="auto-copy-safe", drag_and_drop="no")
+            nice_to_have = dict(hwdec="auto-copy-safe" if self._hwdec else "no", drag_and_drop="no")
             try:
                 self.player = mpv.MPV(**options, **nice_to_have)
             except Exception:  # an option this libmpv build does not know
@@ -298,7 +304,7 @@ class PlayerWidget(QWidget):
                 self.player.sub_file = self._subtitles
             except Exception as e:
                 print(f"[player] could not set the text layers: {e}")
-        total = sum(n for _p, _s, n in sources)
+        total = sum(s.length for s in segments)
         if self._settling:  # reloaded again before the last reload finished: keep its "resume" choice
             was_playing = self._resume
         else:
@@ -363,11 +369,13 @@ class PlayerWidget(QWidget):
         if look == self._applied_look:
             return
         self._applied_look = look
-        transform, meta_rotation, fade_in, fade_out, start, end = look
-        need = (not transform.is_default) or fade_in > 0 or fade_out > 0
+        transform, meta_rotation, fade_in, fade_out, start, end, speed = look
+        need = (not transform.is_default) or fade_in > 0 or fade_out > 0 or abs(speed - 1.0) > 1e-9
         # no transform and no fade: mpv shows the picture as before (it turns phone videos by itself).
-        # with a transform or a fade: the filters do everything, including the phone rotation.
+        # with a transform, a fade or a speed change: the filters do everything, including the phone rotation.
         filters = video_filters(transform, meta_rotation) if need else []
+        if abs(speed - 1.0) > 1e-9:
+            filters.append(f"setpts=PTS/{speed:.6f}")
         if fade_in > 0:
             filters.append(f"fade=t=in:st={start:.3f}:d={min(fade_in, end - start):.3f}")
         if fade_out > 0:
@@ -423,6 +431,15 @@ class PlayerWidget(QWidget):
 
     def toggle_mute(self):
         self.set_muted(not self._muted)
+
+    def set_hwdec(self, enabled):
+        """Turn hardware decoding on / off (off helps on a graphics driver that cannot copy frames back)."""
+        self._hwdec = bool(enabled)
+        if self.player is not None:
+            try:
+                self.player.hwdec = "auto-copy-safe" if self._hwdec else "no"
+            except Exception as e:
+                print(f"[player] could not set hardware decoding: {e}")
 
     def set_muted(self, muted):
         if muted == self._muted:

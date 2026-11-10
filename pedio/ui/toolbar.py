@@ -6,7 +6,9 @@ CATEGORIES = {
     "Video":   ["Import", "Trim Start", "Trim End", "Split", "Delete", "Crop", "Aspect Ratio", "Rotate", "Flip H", "Flip V", "Speed"],
     "Audio":   ["Add Audio", "Extract Audio", "Volume", "Mute", "Fade In/Out"],
     "Effects": ["Fade In", "Fade Out", "Transition"],
-    "Text":    ["Add Text", "Edit Text"],
+    "Text":    ["Add Text", "Edit Text", "Keyframes"],
+    "Image":   ["Add Image", "Image Settings"],
+    "Project": ["Undo", "Redo", "Save Project", "Open Project", "Settings"],
     "Export":  ["Export Video", "Export Settings"],
 }
 

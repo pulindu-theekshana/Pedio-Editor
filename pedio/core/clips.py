@@ -5,13 +5,20 @@ from typing import NamedTuple
 
 from PySide6.QtCore import QObject, Signal
 
-from pedio.core.audio import AudioClip
-from pedio.core.layers import TextLayer, normalize_color
+from pedio.core.audio import AudioClip, reserve_ids as reserve_audio_ids
+from pedio.core.keyframes import Keyframe, copy_anim, remove_keyframe, set_keyframe, value_at
+from pedio.core.layers import ImageLayer, TextLayer, normalize_color, reserve_ids as reserve_layer_ids
 from pedio.core.transform import Transform, centered_crop
 
 MIN_CLIP = 0.1  # shortest clip allowed, in seconds
+MIN_SPEED, MAX_SPEED = 0.25, 4.0
 
 _next_id = count(1)
+
+
+def reserve_ids(max_id):
+    global _next_id
+    _next_id = count(int(max_id) + 1)
 
 
 @dataclass
@@ -26,10 +33,18 @@ class Clip:
     transform: Transform = Transform()   # mirror / rotate / crop chosen by the user
     fade_in: float = 0.0             # seconds of fade from black at the clip start (0 .. 2)
     fade_out: float = 0.0            # seconds of fade to black at the clip end (0 .. 2)
+    speed: float = 1.0               # 1.0 = normal; 2.0 = twice as fast (timeline length halves)
+    anim: dict = field(default_factory=dict)   # property -> [Keyframe]
+
+    @property
+    def source_length(self):
+        """Seconds of the source file used by this clip (before speed)."""
+        return self.src_out - self.src_in
 
     @property
     def length(self):
-        return self.src_out - self.src_in
+        """Seconds the clip takes on the timeline (after speed)."""
+        return self.source_length / max(self.speed, MIN_SPEED)
 
     @property
     def picture_size(self):
@@ -39,7 +54,8 @@ class Clip:
 
 
 class Segment(NamedTuple):
-    """One piece of the edit for the player and the export: a part of a file + how to show it."""
+    """One piece of the edit for the player and the export: a part of a file + how to show it.
+    `length` is timeline seconds; the source range is `length * speed`."""
     path: str
     start: float          # seconds into the file
     length: float
@@ -47,6 +63,11 @@ class Segment(NamedTuple):
     meta_rotation: int = 0
     fade_in: float = 0.0
     fade_out: float = 0.0
+    speed: float = 1.0
+
+    @property
+    def source_length(self):
+        return self.length * max(self.speed, MIN_SPEED)
 
 
 class Project(QObject):
@@ -60,9 +81,11 @@ class Project(QObject):
         self.clips = []
         self.audio_clips = []
         self.text_layers = []
+        self.image_layers = []
         self.selected_id = 0        # 0 = no video clip selected
         self.selected_audio_id = 0  # 0 = no audio clip selected
         self.selected_text_id = 0   # 0 = no text layer selected
+        self.selected_image_id = 0  # 0 = no image layer selected
 
     # ------------------------------------------------------------------ reading
     def total(self):
@@ -105,13 +128,14 @@ class Project(QObject):
         out = []
         for c in self.clips:
             last = out[-1] if out else None
-            if (last and last.path == c.path and abs(last.start + last.length - c.src_in) < 1e-6
+            if (last and last.path == c.path and abs(last.speed - c.speed) < 1e-9
+                    and abs(last.start + last.source_length - c.src_in) < 1e-6
                     and last.transform == c.transform and abs(last.fade_out) < 1e-6
                     and abs(c.fade_in) < 1e-6):
                 out[-1] = last._replace(length=last.length + c.length, fade_out=c.fade_out)
             else:
                 out.append(Segment(c.path, c.src_in, c.length, c.transform, c.meta_rotation,
-                                   c.fade_in, c.fade_out))
+                                   c.fade_in, c.fade_out, c.speed))
         return out
 
     # ------------------------------------------------------------------ audio reading
@@ -132,6 +156,8 @@ class Project(QObject):
             end = max(end, c.end)
         for layer in self.text_layers:
             end = max(end, layer.end)
+        for layer in self.image_layers:
+            end = max(end, layer.end)
         return end
 
     # ------------------------------------------------------------------ text layers
@@ -145,6 +171,17 @@ class Project(QObject):
         i = self.text_index_of(layer_id)
         return self.text_layers[i] if i >= 0 else None
 
+    # ------------------------------------------------------------------ image layers
+    def image_index_of(self, layer_id):
+        for i, layer in enumerate(self.image_layers):
+            if layer.id == layer_id:
+                return i
+        return -1
+
+    def image_by_id(self, layer_id):
+        i = self.image_index_of(layer_id)
+        return self.image_layers[i] if i >= 0 else None
+
     # ------------------------------------------------------------------ selection
     def select(self, clip_id):
         if clip_id and self.index_of(clip_id) < 0:
@@ -153,6 +190,7 @@ class Project(QObject):
             self.selected_id = clip_id
             self.selected_audio_id = 0
             self.selected_text_id = 0
+            self.selected_image_id = 0
             self.selection_changed.emit()
 
     def select_audio(self, audio_id):
@@ -162,6 +200,7 @@ class Project(QObject):
             self.selected_audio_id = audio_id
             self.selected_id = 0
             self.selected_text_id = 0
+            self.selected_image_id = 0
             self.selection_changed.emit()
 
     def select_text(self, layer_id):
@@ -171,13 +210,25 @@ class Project(QObject):
             self.selected_text_id = layer_id
             self.selected_id = 0
             self.selected_audio_id = 0
+            self.selected_image_id = 0
             self.selection_changed.emit()
 
-    def clear_selection(self):
-        if self.selected_id or self.selected_audio_id or self.selected_text_id:
+    def select_image(self, layer_id):
+        if layer_id and self.image_index_of(layer_id) < 0:
+            layer_id = 0
+        if layer_id != self.selected_image_id:
+            self.selected_image_id = layer_id
             self.selected_id = 0
             self.selected_audio_id = 0
             self.selected_text_id = 0
+            self.selection_changed.emit()
+
+    def clear_selection(self):
+        if self.selected_id or self.selected_audio_id or self.selected_text_id or self.selected_image_id:
+            self.selected_id = 0
+            self.selected_audio_id = 0
+            self.selected_text_id = 0
+            self.selected_image_id = 0
             self.selection_changed.emit()
 
     # ------------------------------------------------------------------ edits (each returns True if something changed)
@@ -250,7 +301,7 @@ class Project(QObject):
             end = start + MIN_CLIP
             if "end" in updates or "start" in updates:
                 updates["end"] = end
-        for name in ("x", "y"):
+        for name in ("x", "y", "opacity"):
             if name in updates:
                 updates[name] = min(max(float(updates[name]), 0.0), 1.0)
         if "size" in updates:
@@ -265,6 +316,122 @@ class Project(QObject):
             return False
         for name, value in updates.items():
             setattr(layer, name, value)
+        self.changed.emit()
+        return True
+
+    # ------------------------------------------------------------------ image layers
+    def add_image_layer(self, path, start=0.0, end=None, x=0.5, y=0.5, scale=0.5, opacity=1.0):
+        """Add a picture over the timeline. end defaults to start + 3 s."""
+        start = max(float(start), 0.0)
+        end = start + 3.0 if end is None else float(end)
+        layer = ImageLayer(str(path), start, max(end, start + MIN_CLIP), float(x), float(y),
+                           float(scale), float(opacity))
+        self.image_layers.append(layer)
+        self.changed.emit()
+        return layer
+
+    def remove_image_layer(self, layer_id):
+        i = self.image_index_of(layer_id)
+        if i < 0:
+            return False
+        del self.image_layers[i]
+        if self.selected_image_id == layer_id:
+            self.selected_image_id = 0
+            self.selection_changed.emit()
+        self.changed.emit()
+        return True
+
+    def update_image_layer(self, layer_id, **changes):
+        """Change any ImageLayer field by name (path, start, end, x, y, scale, opacity)."""
+        layer = self.image_by_id(layer_id)
+        if layer is None:
+            return False
+        updates = {name: value for name, value in changes.items()
+                   if name in ImageLayer.__dataclass_fields__ and name not in ("id", "anim")}
+        if "start" in updates:
+            updates["start"] = max(float(updates["start"]), 0.0)
+        start = updates.get("start", layer.start)
+        end = float(updates.get("end", layer.end))
+        updates["end"] = max(end, start + MIN_CLIP)
+        for name in ("x", "y", "opacity"):
+            if name in updates:
+                updates[name] = min(max(float(updates[name]), 0.0), 1.0)
+        if "scale" in updates:
+            updates["scale"] = min(max(float(updates["scale"]), 0.05), 2.0)
+        if "path" in updates:
+            updates["path"] = str(updates["path"])
+        if all(getattr(layer, name) == value for name, value in updates.items()):
+            return False
+        for name, value in updates.items():
+            setattr(layer, name, value)
+        self.changed.emit()
+        return True
+
+    # ------------------------------------------------------------------ keyframes (text / image / audio)
+    _KEY_LIMITS = {"x": (0.0, 1.0), "y": (0.0, 1.0), "opacity": (0.0, 1.0),
+                   "size": (8.0, 400.0), "scale": (0.05, 2.0), "volume": (0.0, 2.0)}
+
+    def _target_for(self, kind, item_id):
+        if kind == "text":
+            return self.text_by_id(item_id)
+        if kind == "image":
+            return self.image_by_id(item_id)
+        if kind == "audio":
+            return self.audio_by_id(item_id)
+        return None
+
+    def set_keyframe(self, kind, item_id, prop, t, value, easing="linear"):
+        """Add / update a keyframe of a text, image or audio layer. Returns True if something changed."""
+        target = self._target_for(kind, item_id)
+        if target is None or prop not in self._KEY_LIMITS:
+            return False
+        lo, hi = self._KEY_LIMITS[prop]
+        value = min(max(float(value), lo), hi)
+        current = target.anim.get(prop, [])
+        points = set_keyframe(current, t, value, easing)
+        if points == current:
+            return False
+        target.anim[prop] = points
+        self.changed.emit()
+        return True
+
+    def remove_keyframe(self, kind, item_id, prop, t):
+        target = self._target_for(kind, item_id)
+        if target is None or prop not in target.anim:
+            return False
+        current = target.anim[prop]
+        points = remove_keyframe(current, t)
+        if points == current:
+            return False
+        if points:
+            target.anim[prop] = points
+        else:
+            target.anim.pop(prop, None)
+        self.changed.emit()
+        return True
+
+    def clear_keyframes(self, kind, item_id, prop=None):
+        target = self._target_for(kind, item_id)
+        if target is None or not target.anim:
+            return False
+        if prop is None or prop not in target.anim:
+            if prop is not None:
+                return False
+            target.anim = {}
+        else:
+            target.anim.pop(prop, None)
+        self.changed.emit()
+        return True
+
+    def copy_anim(self, kind, item_id, into_id):
+        """Copy every keyframe track of one item to another item of the same kind (Step 15c)."""
+        source = self._target_for(kind, item_id)
+        target = self._target_for(kind, into_id)
+        if source is None or target is None:
+            return False
+        if target.anim == source.anim:
+            return False
+        target.anim = copy_anim(source.anim)
         self.changed.emit()
         return True
 
@@ -321,7 +488,7 @@ class Project(QObject):
         c = self.clips[i]
         if offset < MIN_CLIP or c.length - offset < MIN_CLIP:
             return False
-        cut = c.src_in + offset
+        cut = c.src_in + offset * c.speed
         self.clips.insert(i + 1, replace(c, src_in=cut, id=next(_next_id)))
         c.src_out = cut
         self.changed.emit()
@@ -372,7 +539,7 @@ class Project(QObject):
         if offset < 0.001 or c.length - offset < MIN_CLIP:
             return None
         start = t - offset
-        return start if self.trim_start(c.id, c.src_in + offset) else None
+        return start if self.trim_start(c.id, c.src_in + offset * c.speed) else None
 
     def trim_end_at(self, t):
         """Cut the end of the clip under t, from t on. Returns where the playhead should go, or None."""
@@ -382,7 +549,7 @@ class Project(QObject):
         c = self.clips[i]
         if offset < MIN_CLIP:
             return None
-        return t if self.trim_end(c.id, c.src_in + offset) else None
+        return t if self.trim_end(c.id, c.src_in + offset * c.speed) else None
 
     def move(self, clip_id, new_index):
         """Put a clip at new_index (its index in the list after the move)."""
@@ -432,6 +599,19 @@ class Project(QObject):
         if abs(fade_in - c.fade_in) < 1e-6 and abs(fade_out - c.fade_out) < 1e-6:
             return False
         c.fade_in, c.fade_out = fade_in, fade_out
+        self.changed.emit()
+        return True
+
+    # ---- clip speed (setpts / atempo)
+    def set_speed(self, clip_id, speed):
+        """0.25x .. 4x. The timeline length of the clip changes; the source range does not."""
+        i = self.index_of(clip_id)
+        if i < 0:
+            return False
+        speed = min(max(float(speed), MIN_SPEED), MAX_SPEED)
+        if abs(speed - self.clips[i].speed) < 1e-6:
+            return False
+        self.clips[i].speed = speed
         self.changed.emit()
         return True
 

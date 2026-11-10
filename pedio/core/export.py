@@ -15,13 +15,15 @@ from PySide6.QtCore import QThread, Signal
 
 from pedio.core.audio import AudioClip
 from pedio.core.clips import Segment
-from pedio.core.layers import TextLayer, build_ass
+from pedio.core.keyframes import copy_anim, expression
+from pedio.core.layers import ImageLayer, TextLayer, build_ass
 from pedio.core.transform import output_size, stream_rotation, video_filters
 from pedio.core.workers import CREATE_NO_WINDOW
 from pedio.paths import find_tool
 
 AUDIO_RATE = 48000
 DEFAULT_FPS = Fraction(30)
+CONTAINERS = ("mp4", "mkv", "webm")
 
 
 class ExportError(Exception):
@@ -30,12 +32,30 @@ class ExportError(Exception):
 
 @dataclass
 class ExportSettings:
-    """Later steps (crop, export settings) add their options here."""
-    crf: int = 20                 # x264 quality: lower = better + bigger file
-    preset: str = "veryfast"      # x264 speed / size trade-off
+    """What the Export Settings window (and the export itself) need to know."""
+    crf: int = 20                 # quality: lower = better + bigger file
+    preset: str = "veryfast"      # x264 / vp9 speed / size trade-off
     audio_bitrate: str = "192k"
     size: tuple = None            # (width, height); None = size of the first clip (after its crop / rotate)
     fps: Fraction = None          # None = frame rate of the first clip
+    format: str = "mp4"           # mp4 | mkv | webm
+
+
+def atempo_chain(speed):
+    """ffmpeg atempo only takes 0.5 .. 2.0 per filter, so chain it for 0.25x / 4x."""
+    speed = float(speed)
+    if abs(speed - 1.0) < 1e-9:
+        return ""
+    parts = []
+    while speed > 2.0:
+        parts.append("atempo=2.0")
+        speed /= 2.0
+    while speed < 0.5:
+        parts.append("atempo=0.5")
+        speed /= 0.5
+    if abs(speed - 1.0) > 1e-9:
+        parts.append(f"atempo={speed:.6f}")
+    return "".join(f",{part}" for part in parts)
 
 
 @dataclass
@@ -97,7 +117,12 @@ def probe_audio(path):
 
 def _copy_audio_clips(audio_clips):
     """Accept AudioClip instances or their field tuples, and snapshot the result."""
-    return [replace(clip) if isinstance(clip, AudioClip) else AudioClip(*clip) for clip in audio_clips]
+    out = []
+    for clip in audio_clips:
+        clip = replace(clip) if isinstance(clip, AudioClip) else AudioClip(*clip)
+        clip.anim = copy_anim(clip.anim)
+        out.append(clip)
+    return out
 
 
 def _active_audio_clips(audio_clips, duration):
@@ -106,10 +131,19 @@ def _active_audio_clips(audio_clips, duration):
             and clip.length > 0 and clip.start < duration]
 
 
+def _volume_part(clip):
+    """Plain volume, or a `t` expression when the clip has volume keyframes (timeline seconds)."""
+    points = (clip.anim or {}).get("volume")
+    if not points:
+        return f"volume={clip.volume:.6f}"
+    expr = expression(points, clip.start, clip.end, clip.volume, shift=-clip.start)
+    return f"volume='{expr}'"
+
+
 def _extra_audio_filter(clip):
     """Volume + fade in / out for one AudioClip, before it is delayed and mixed."""
     chain = (f"aresample={AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,"
-             f"atrim=duration={clip.length:.6f},asetpts=PTS-STARTPTS,volume={clip.volume:.6f}")
+             f"atrim=duration={clip.length:.6f},asetpts=PTS-STARTPTS,{_volume_part(clip)}")
     if clip.fade_in > 0:
         chain += f",afade=t=in:st=0:d={min(clip.fade_in, clip.length):.6f}"
     if clip.fade_out > 0:
@@ -139,19 +173,23 @@ def _segment_audio_fades(seg):
 
 
 # ---------------------------------------------------------------------- command
-def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=(), text_layers=(), ass_name=None):
+def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=(), text_layers=(),
+                  ass_name=None, image_layers=()):
     """The ffmpeg command line. clips = [Segment] (3-tuples work too), sources = {path: SourceInfo}.
 
     Every clip is cut with input seeking (-ss / -t), mirrored / rotated / cropped (video_filters, the same
-    filters the preview uses), brought to one size / frame rate / audio format, then joined with the
-    concat filter. A clip without sound gets silence of the same length.
+    filters the preview uses), sped up / slowed down (setpts + atempo), brought to one size / frame rate /
+    audio format, then joined with the concat filter. A clip without sound gets silence of the same length.
     The output size is the size of the first clip after its transform; the other clips are fitted into it.
-    Extra audio clips are placed at their timeline start and mixed over the video's original sound.
-    Text layers are drawn by the `ass` filter from a file the worker writes (`ass_name`, relative to its cwd);
-    the same ASS file is shown by the preview.
+    Image layers are overlaid (with their timeline range), then text is drawn by the `ass` filter from a
+    file the worker writes (`ass_name`, relative to its cwd). Extra audio clips are placed at their timeline
+    start and mixed over the video's original sound.
     """
     clips = [Segment(*c) for c in clips]
-    audio_clips = _active_audio_clips(_copy_audio_clips(audio_clips), sum(c.length for c in clips))
+    total = sum(c.length for c in clips)
+    audio_clips = _active_audio_clips(_copy_audio_clips(audio_clips), total)
+    image_layers = [layer.copy() if isinstance(layer, ImageLayer) else ImageLayer(*layer)
+                    for layer in (image_layers or [])]
     first = sources[clips[0].path]
     width, height = settings.size or output_size(first.width, first.height, clips[0].transform)
     width, height = width - width % 2, height - height % 2          # yuv420p needs even numbers
@@ -161,25 +199,27 @@ def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=(), te
     parts, joined = [], ""
     for i, seg in enumerate(clips):
         path, length = seg.path, seg.length
-        cmd += ["-ss", f"{seg.start:.6f}", "-t", f"{length:.6f}", "-i", path]
+        source_length = seg.source_length
+        cmd += ["-ss", f"{seg.start:.6f}", "-t", f"{source_length:.6f}", "-i", path]
         # ffmpeg turns phone videos upright by itself, so meta_rotation stays 0 here (the player has to do it)
         look = "".join(f + "," for f in video_filters(seg.transform))
+        speed = f"setpts=PTS/{seg.speed:.6f}," if abs(seg.speed - 1.0) > 1e-9 else ""
         fade = _segment_fades(seg)
         parts.append(
-            f"[{i}:v:0]{look}scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"[{i}:v:0]{look}{speed}scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
             f"fps={fps.numerator}/{fps.denominator},format=yuv420p,setpts=PTS-STARTPTS{fade}[v{i}]")
+        atempo = atempo_chain(seg.speed)
         if sources[path].has_audio:
             audio = f"[{i}:a:0]aresample={AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,apad"
+            parts.append(f"{audio},atrim=duration={source_length:.6f},asetpts=PTS-STARTPTS{atempo},"
+                         f"atrim=duration={length:.6f}{_segment_audio_fades(seg)}[a{i}]")
         else:
-            audio = f"anullsrc=r={AUDIO_RATE}:cl=stereo"
-        parts.append(f"{audio},atrim=duration={length:.6f},asetpts=PTS-STARTPTS{_segment_audio_fades(seg)}[a{i}]")
+            parts.append(f"anullsrc=r={AUDIO_RATE}:cl=stereo,atrim=duration={length:.6f},"
+                         f"asetpts=PTS-STARTPTS{_segment_audio_fades(seg)}[a{i}]")
         joined += f"[v{i}][a{i}]"
     parts.append(f"{joined}concat=n={len(clips)}:v=1:a=1[v][basea]")
     video_out = "[v]"
-    if ass_name and text_layers:
-        parts.append(f"[v]ass={ass_name}[vtext]")
-        video_out = "[vtext]"
 
     if audio_clips:
         mixed = "[basea]"
@@ -192,13 +232,43 @@ def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=(), te
     else:
         parts.append("[basea]anull[a]")
 
-    cmd += [
-        "-filter_complex", ";".join(parts), "-map", video_out, "-map", "[a]",
-        "-c:v", "libx264", "-preset", settings.preset, "-crf", str(settings.crf), "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", settings.audio_bitrate,
-        "-movflags", "+faststart", "-f", "mp4",
-        "-progress", "pipe:1", "-nostats", out_path,
-    ]
+    # Image layers sit under the text. Each one is an input that is looped for the whole timeline.
+    active_images = [layer for layer in image_layers
+                     if layer.path and layer.end > layer.start and layer.start < total]
+    image_input = len(clips) + len(audio_clips)
+    for n, layer in enumerate(active_images):
+        cmd += ["-loop", "1", "-framerate", f"{fps.numerator}/{fps.denominator}",
+                "-t", f"{total:.6f}", "-i", layer.path]
+        w = max(2, int(round(width * layer.scale)))
+        alpha = min(max(float(layer.opacity), 0.0), 1.0)
+        parts.append(f"[{image_input + n}:v]scale={w}:-1,format=rgba,"
+                     f"colorchannelmixer=aa={alpha:.6f}[img{n}]")
+        x = min(max(float(layer.x), 0.0), 1.0)
+        y = min(max(float(layer.y), 0.0), 1.0)
+        parts.append(f"{video_out}[img{n}]overlay=x=(W-w)*{x:.6f}:y=(H-h)*{y:.6f}:"
+                     f"enable='between(t,{layer.start:.6f},{layer.end:.6f})'[vimg{n}]")
+        video_out = f"[vimg{n}]"
+
+    if ass_name and text_layers:
+        parts.append(f"{video_out}ass={ass_name}[vtext]")
+        video_out = "[vtext]"
+
+    fmt = settings.format if settings.format in CONTAINERS else "mp4"
+    if fmt == "webm":
+        video_codec = ["-c:v", "libvpx-vp9", "-crf", str(settings.crf), "-b:v", "0", "-row-mt", "1"]
+        audio_codec = ["-c:a", "libopus", "-b:a", settings.audio_bitrate]
+        container = "webm"
+    else:
+        video_codec = ["-c:v", "libx264", "-preset", settings.preset, "-crf", str(settings.crf)]
+        audio_codec = ["-c:a", "aac", "-b:a", settings.audio_bitrate]
+        container = "matroska" if fmt == "mkv" else "mp4"
+
+    cmd += ["-filter_complex", ";".join(parts), "-map", video_out, "-map", "[a]"]
+    cmd += video_codec + ["-pix_fmt", "yuv420p"] + audio_codec
+    if fmt == "mp4":
+        cmd += ["-movflags", "+faststart"]
+    cmd += ["-t", f"{total:.6f}", "-f", container,
+            "-progress", "pipe:1", "-nostats", out_path]
     return cmd
 
 
@@ -210,13 +280,15 @@ def build_audio_mix_command(ffmpeg, clips, sources, out_path, audio_clips=()):
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
     parts, joined = [], ""
     for i, seg in enumerate(clips):
-        cmd += ["-ss", f"{seg.start:.6f}", "-t", f"{seg.length:.6f}", "-i", seg.path]
+        cmd += ["-ss", f"{seg.start:.6f}", "-t", f"{seg.source_length:.6f}", "-i", seg.path]
         if sources[seg.path].has_audio:
             audio = f"[{i}:a:0]aresample={AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,apad"
+            parts.append(f"{audio},atrim=duration={seg.source_length:.6f},asetpts=PTS-STARTPTS"
+                         f"{atempo_chain(seg.speed)},atrim=duration={seg.length:.6f}"
+                         f"{_segment_audio_fades(seg)}[a{i}]")
         else:
-            audio = f"anullsrc=r={AUDIO_RATE}:cl=stereo"
-        parts.append(f"{audio},atrim=duration={seg.length:.6f},asetpts=PTS-STARTPTS"
-                     f"{_segment_audio_fades(seg)}[a{i}]")
+            parts.append(f"anullsrc=r={AUDIO_RATE}:cl=stereo,atrim=duration={seg.length:.6f},"
+                         f"asetpts=PTS-STARTPTS{_segment_audio_fades(seg)}[a{i}]")
         joined += f"[a{i}]"
     parts.append(f"{joined}concat=n={len(clips)}:v=0:a=1[basea]")
     if audio_clips:
@@ -254,12 +326,13 @@ class ExportWorker(QThread):
     failed = Signal(str)         # message for the user
     cancelled = Signal()
 
-    def __init__(self, clips, out_path, settings=None, parent=None, audio_clips=None, text_layers=None):
+    def __init__(self, clips, out_path, settings=None, parent=None, audio_clips=None, text_layers=None,
+                 image_layers=None):
         super().__init__(parent)
         self.clips = [Segment(*c) for c in clips]     # copy: later edits do not change a running export
         self.audio_clips = _copy_audio_clips(audio_clips or [])
-        self.text_layers = [layer.copy() if isinstance(layer, TextLayer) else TextLayer(*layer)
-                            for layer in (text_layers or [])]
+        self.text_layers = [layer.copy() for layer in (text_layers or []) if isinstance(layer, TextLayer)]
+        self.image_layers = [layer.copy() for layer in (image_layers or []) if isinstance(layer, ImageLayer)]
         self.out_path = out_path
         self.settings = settings or ExportSettings()
         self._stop = False
@@ -307,6 +380,10 @@ class ExportWorker(QThread):
                 if self._stop:
                     return self._cancel(part)
                 probe_audio(clip.path)
+        for layer in self.image_layers:
+            if layer.path and not os.path.isfile(layer.path):
+                raise ExportError(f"Could not find the image {os.path.basename(layer.path)}. "
+                                  "Was it moved or deleted?")
 
         ass_dir = None
         ass_name = None
@@ -319,7 +396,7 @@ class ExportWorker(QThread):
                 fh.write(build_ass(self.text_layers))
         try:
             cmd = build_command(ffmpeg, self.clips, sources, part, self.settings, audio_clips,
-                                self.text_layers, ass_name)
+                                self.text_layers, ass_name, self.image_layers)
             with tempfile.TemporaryFile() as errors:  # a file, so ffmpeg can never block on a full pipe
                 self._proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=errors, stdin=subprocess.DEVNULL,

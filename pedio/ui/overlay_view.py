@@ -8,7 +8,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPainterPath, 
 from PySide6.QtWidgets import QWidget
 
 from pedio.core.clips import Project
-from pedio.core.layers import CANVAS_H, TextLayer
+from pedio.core.layers import CANVAS_H, TextLayer, layer_value
 
 
 class TextOverlay(QWidget):
@@ -19,6 +19,7 @@ class TextOverlay(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.project = None
+        self.position = 0.0
         self._layer_id = 0
         self._drag = False
         self._ghost = None            # (x, y) centre in widget pixels while dragging
@@ -35,6 +36,14 @@ class TextOverlay(QWidget):
         project.selection_changed.connect(self.refresh)
         project.changed.connect(self.refresh)
         self.refresh()
+
+    def set_position(self, t):
+        t = float(t)
+        if abs(t - self.position) < 1e-6:
+            return
+        self.position = t
+        if self.isVisible():
+            self.update()
 
     def refresh(self):
         layer = self._layer()
@@ -64,7 +73,9 @@ class TextOverlay(QWidget):
     def _centre(self, layer):
         if self._ghost is not None:
             return self._ghost
-        return QPointF(layer.x * self.width(), layer.y * self.height())
+        x = layer_value(layer, "x", self.position, layer.x)
+        y = layer_value(layer, "y", self.position, layer.y)
+        return QPointF(x * self.width(), y * self.height())
 
     def _text_rect(self, layer):
         font = self._font(layer)
@@ -82,7 +93,9 @@ class TextOverlay(QWidget):
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setOpacity(min(max(layer_value(layer, "opacity", self.position, layer.opacity), 0.0), 1.0))
         self._paint_text(painter, layer, self._centre(layer))
+        painter.setOpacity(1.0)
         if self._drag:
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(QColor(80, 160, 255, 220), 1, Qt.PenStyle.DashLine))

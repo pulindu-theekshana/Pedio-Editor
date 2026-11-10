@@ -59,6 +59,9 @@ class TextPanel(QDialog):
         self.color = _color_button("#ffffff")
         self.outline_color = _color_button("#000000")
         self.shadow_color = _color_button("#000000")
+        self.opacity = QSlider(Qt.Orientation.Horizontal)
+        self.opacity.setRange(0, 100)
+        self.opacity_label = QLabel()
         self.start = QDoubleSpinBox()
         self.end = QDoubleSpinBox()
         for box in (self.start, self.end):
@@ -83,6 +86,8 @@ class TextPanel(QDialog):
         form.addRow("Shadow", _slider_row(self.shadow))
         form.addRow("", self.shadow_label)
         form.addRow("Shadow colour", self.shadow_color)
+        form.addRow("Opacity", _slider_row(self.opacity))
+        form.addRow("", self.opacity_label)
         form.addRow("Start", self.start)
         form.addRow("End", self.end)
         form.addRow("X", self.x)
@@ -97,6 +102,7 @@ class TextPanel(QDialog):
         self.size.valueChanged.connect(self._queue_apply)
         self.outline.valueChanged.connect(self._queue_apply)
         self.shadow.valueChanged.connect(self._queue_apply)
+        self.opacity.valueChanged.connect(self._queue_apply)
         self.start.valueChanged.connect(self._queue_apply)
         self.end.valueChanged.connect(self._queue_apply)
         self.x.valueChanged.connect(self._queue_apply)
@@ -112,9 +118,9 @@ class TextPanel(QDialog):
     def refresh(self):
         layer = self.project.text_by_id(self.project.selected_text_id)
         self._updating = True
-        for w in (self.text, self.size, self.outline, self.shadow, self.start, self.end,
-                  self.x, self.y, self.color, self.outline_color, self.shadow_color,
-                  self.delete_btn):
+        for w in (self.text, self.size, self.outline, self.shadow, self.opacity,
+                  self.start, self.end, self.x, self.y, self.color, self.outline_color,
+                  self.shadow_color, self.delete_btn):
             w.setEnabled(layer is not None)
         if layer is None:
             self.title.setText("No text selected (Text > Add Text)")
@@ -124,6 +130,7 @@ class TextPanel(QDialog):
             self.size.setValue(int(layer.size))
             self.outline.setValue(int(layer.outline))
             self.shadow.setValue(int(layer.shadow))
+            self.opacity.setValue(round(layer.opacity * 100))
             _paint_swatch(self.color, layer.color)
             _paint_swatch(self.outline_color, layer.outline_color)
             _paint_swatch(self.shadow_color, layer.shadow_color)
@@ -138,6 +145,7 @@ class TextPanel(QDialog):
         self.size_label.setText(f"{self.size.value()} px (on a 1920 x 1080 canvas)")
         self.outline_label.setText(f"{self.outline.value()} px")
         self.shadow_label.setText(f"{self.shadow.value()} px")
+        self.opacity_label.setText(f"{self.opacity.value()}%")
 
     def _queue_apply(self, _value=None):
         self._update_labels()
@@ -159,6 +167,7 @@ class TextPanel(QDialog):
             outline_color=self.outline_color.property("color"),
             shadow=self.shadow.value(),
             shadow_color=self.shadow_color.property("color"),
+            opacity=self.opacity.value() / 100,
             start=start,
             end=end,
             x=self.x.value() / 100,

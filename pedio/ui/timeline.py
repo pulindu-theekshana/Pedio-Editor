@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton, QScroll
                                QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget)
 
 from pedio.core.clips import MIN_CLIP
+from pedio.core.keyframes import key_times
 from pedio.core.workers import PEAKS_PER_SECOND, ThumbnailWorker, WaveformWorker, thumb_step
 
 RULER_H = 28
@@ -24,7 +25,8 @@ VIDEO_TRACK_Y = RULER_H + GAP
 AUDIO_TRACK_Y = VIDEO_TRACK_Y + TRACK_H + GAP
 CLIP_TRACK_Y = AUDIO_TRACK_Y + TRACK_H + GAP
 TEXT_TRACK_Y = CLIP_TRACK_Y + TRACK_H + GAP
-VIEW_H = TEXT_TRACK_Y + TRACK_H
+IMAGE_TRACK_Y = TEXT_TRACK_Y + TRACK_H + GAP
+VIEW_H = IMAGE_TRACK_Y + TRACK_H
 HEADER_W = 104
 MAX_PPS = 300.0   # most zoomed-in: 300 pixels per second
 HANDLE_W = 8      # trim handle width in pixels (inside the clip edge)
@@ -40,6 +42,7 @@ VIDEO_BG = QColor("#33404d")
 AUDIO_BG = QColor("#26332a")
 CLIP_BG = QColor("#2d3340")
 TEXT_BG = QColor("#3a2f3d")
+IMAGE_BG = QColor("#2f3a45")
 CLIP_WAVE = QColor("#6fa8ff")
 WAVE = QColor("#58c26b")
 WAVE_MUTED = QColor("#6c6c6c")
@@ -351,11 +354,14 @@ class TimelineView(QWidget):
             for i, s in enumerate(slots):
                 if s.clip.id != clip_id:
                     continue
+                speed = max(s.clip.speed, 0.01)
                 if side == "l":   # the left edge follows the mouse, the right edge stays (the gap closes on release)
-                    slots[i] = s._replace(t0=s.t0 + (value - s.clip.src_in), src_in=value)
+                    new_len = (s.clip.src_out - value) / speed
+                    slots[i] = s._replace(t0=s.t1 - new_len, src_in=value)
                 else:             # the right edge follows the mouse, the clips after it move along
-                    delta = value - s.clip.src_out
-                    slots[i] = s._replace(t1=s.t1 + delta, src_out=value)
+                    new_len = (value - s.clip.src_in) / speed
+                    delta = new_len - (s.t1 - s.t0)
+                    slots[i] = s._replace(t1=s.t0 + new_len, src_out=value)
                     for k in range(i + 1, len(slots)):
                         o = slots[k]
                         slots[k] = o._replace(t0=o.t0 + delta, t1=o.t1 + delta)
@@ -386,6 +392,14 @@ class TimelineView(QWidget):
     def _text_hit(self, x):
         """The text layer under x on the text lane, or None."""
         for layer in reversed(self.project.text_layers):
+            x0, x1 = self.time_to_x(layer.start), self.time_to_x(layer.end)
+            if x0 <= x < x1:
+                return layer
+        return None
+
+    def _image_hit(self, x):
+        """The image layer under x on the image lane, or None."""
+        for layer in reversed(self.project.image_layers):
             x0, x1 = self.time_to_x(layer.start), self.time_to_x(layer.end)
             if x0 <= x < x1:
                 return layer
@@ -453,7 +467,14 @@ class TimelineView(QWidget):
             else:
                 self.project.clear_selection()
             return
-        if y >= TEXT_TRACK_Y + TRACK_H:       # empty space below the tracks
+        if IMAGE_TRACK_Y <= y < IMAGE_TRACK_Y + TRACK_H:    # image layers
+            layer = self._image_hit(x)
+            if layer is not None:
+                self.project.select_image(layer.id)
+            else:
+                self.project.clear_selection()
+            return
+        if y >= IMAGE_TRACK_Y + TRACK_H:      # empty space below the tracks
             self.project.clear_selection()
             return
         part, i = self._hit(x)
@@ -478,6 +499,10 @@ class TimelineView(QWidget):
             if TEXT_TRACK_Y <= y < TEXT_TRACK_Y + TRACK_H:
                 self.setCursor(Qt.CursorShape.PointingHandCursor
                                if self._text_hit(x) is not None else Qt.CursorShape.ArrowCursor)
+                return
+            if IMAGE_TRACK_Y <= y < IMAGE_TRACK_Y + TRACK_H:
+                self.setCursor(Qt.CursorShape.PointingHandCursor
+                               if self._image_hit(x) is not None else Qt.CursorShape.ArrowCursor)
                 return
             if CLIP_TRACK_Y <= y < CLIP_TRACK_Y + TRACK_H:
                 if self._audio_hit(x) is not None:
@@ -566,11 +591,12 @@ class TimelineView(QWidget):
         start = self.project.starts()[i]
         t = (x + self.scroll_px) / self.pps                       # time under the mouse
         t = self._snap(t, limit=start + clip.length if side == "r" else None)
-        value = clip.src_in + (t - start)
+        speed = max(clip.speed, 0.01)
+        value = clip.src_in + (t - start) * speed
         if side == "l":
-            value = min(max(value, 0.0), clip.src_out - MIN_CLIP)
+            value = min(max(value, 0.0), clip.src_out - MIN_CLIP * speed)
         else:
-            value = min(max(value, clip.src_in + MIN_CLIP), clip.src_duration)
+            value = min(max(value, clip.src_in + MIN_CLIP * speed), clip.src_duration)
         self._trim[2] = value
         self._invalidate()
 
@@ -655,14 +681,16 @@ class TimelineView(QWidget):
                 p.drawPolygon(QPolygon([QPoint(x - 7, 0), QPoint(x + 7, 0), QPoint(x, 12)]))
 
     def _paint_content(self, p, w):
-        video_y, audio_y, clip_y, text_y = VIDEO_TRACK_Y, AUDIO_TRACK_Y, CLIP_TRACK_Y, TEXT_TRACK_Y
+        video_y, audio_y, clip_y = VIDEO_TRACK_Y, AUDIO_TRACK_Y, CLIP_TRACK_Y
+        text_y, image_y = TEXT_TRACK_Y, IMAGE_TRACK_Y
         p.setFont(self._font)
         p.fillRect(0, 0, w, RULER_H, RULER_BG)
-        for y in (video_y, audio_y, clip_y, text_y):
+        for y in (video_y, audio_y, clip_y, text_y, image_y):
             p.fillRect(0, y, w, TRACK_H, TRACK_BG)
-        if not self.project.clips and not self.project.audio_clips and not self.project.text_layers:
+        if (not self.project.clips and not self.project.audio_clips and not self.project.text_layers
+                and not self.project.image_layers):
             p.setPen(LABEL)
-            p.drawText(QRect(0, video_y, w, TRACK_H * 4 + GAP * 3), Qt.AlignmentFlag.AlignCenter,
+            p.drawText(QRect(0, video_y, w, TRACK_H * 5 + GAP * 4), Qt.AlignmentFlag.AlignCenter,
                        "Import a video to see the timeline")
             return
         self._paint_ruler(p, w)
@@ -688,6 +716,10 @@ class TimelineView(QWidget):
             x0, x1 = self.time_to_x(layer.start), self.time_to_x(layer.end)
             if x1 >= 0 and x0 <= w:
                 self._paint_text_layer(p, text_y, layer, x0, x1, w)
+        for layer in self.project.image_layers:
+            x0, x1 = self.time_to_x(layer.start), self.time_to_x(layer.end)
+            if x1 >= 0 and x0 <= w:
+                self._paint_image_layer(p, image_y, layer, x0, x1, w)
 
     def _paint_ruler(self, p, w):
         major, divisions = next(((m, d) for m, d in TICKS if m * self.pps >= 90), TICKS[-1])
@@ -739,7 +771,7 @@ class TimelineView(QWidget):
             x = x0 + i * tile                       # tiles start at the left edge of the clip
             if x >= right:
                 break
-            index = int(round((s.src_in + i * tile / self.pps) / media.thumb_step))
+            index = int(round((s.src_in + i * tile / self.pps * s.clip.speed) / media.thumb_step))
             if index >= len(media.thumbs):          # not made (yet): reuse the last one only when finished
                 index = len(media.thumbs) - 1 if media.thumbs_done else -1
             pixmap = media.thumbs[index] if index >= 0 else None
@@ -773,12 +805,12 @@ class TimelineView(QWidget):
         scale = (TRACK_H / 2 - 4) / 32768
         lines = []
         for x in range(int(left), int(right)):
-            first = int((s.src_in + (x - x0) / self.pps) * PEAKS_PER_SECOND)
+            first = int((s.src_in + (x - x0) / self.pps * s.clip.speed) * PEAKS_PER_SECOND)
             if first < 0:
                 continue
             if first >= count:
                 break
-            last = max(first + 1, int((s.src_in + (x + 1 - x0) / self.pps) * PEAKS_PER_SECOND))
+            last = max(first + 1, int((s.src_in + (x + 1 - x0) / self.pps * s.clip.speed) * PEAKS_PER_SECOND))
             top = int(mid - max(media.maxs[first:last]) * scale)
             bottom = int(mid - min(media.mins[first:last]) * scale)
             lines.append(QLine(x, top, x, max(bottom, top + 1)))
@@ -829,6 +861,9 @@ class TimelineView(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(QPen(SELECT, 2))
             p.drawRect(QRect(int(round(x0)) + 1, y + 1, int(round(x1)) - int(round(x0)) - 2, TRACK_H - 2))
+            p.setBrush(SELECT)
+            p.setPen(Qt.PenStyle.NoPen)
+            self._paint_keys(p, y, clip.anim)
 
     def _paint_text_layer(self, p, y, layer, x0, x1, w):
         """One text layer on the text lane: its text and time range."""
@@ -852,6 +887,44 @@ class TimelineView(QWidget):
             p.setPen(QPen(SELECT, 2))
             p.drawRect(QRect(int(round(x0)) + 1, y + 1,
                              int(round(x1)) - int(round(x0)) - 2, TRACK_H - 2))
+            p.setBrush(SELECT)
+            p.setPen(Qt.PenStyle.NoPen)
+            self._paint_keys(p, y, layer.anim)
+
+    def _paint_image_layer(self, p, y, layer, x0, x1, w):
+        """One image layer on the image lane: its file name and time range."""
+        left, right = max(x0, 0.0), min(x1, float(w))
+        if right <= left:
+            return
+        area = QRect(int(left), y, int(right) - int(left), TRACK_H)
+        p.fillRect(area, IMAGE_BG)
+        p.setPen(QColor(0, 0, 0, 200))
+        for x in (int(round(x0)), int(round(x1))):
+            p.drawLine(x, y, x, y + TRACK_H)
+        text = os.path.basename(layer.path) or "(no image)"
+        avail = int(right - left) - 10
+        if avail > 24:
+            text = self._fm.elidedText(f"{text}  {layer.scale:.0%}", Qt.TextElideMode.ElideRight, avail)
+            p.setPen(LABEL)
+            p.drawText(QRect(int(left) + 5, y, avail, TRACK_H),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+        if layer.id == self.project.selected_image_id:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(SELECT, 2))
+            p.drawRect(QRect(int(round(x0)) + 1, y + 1,
+                             int(round(x1)) - int(round(x0)) - 2, TRACK_H - 2))
+            p.setBrush(SELECT)
+            p.setPen(Qt.PenStyle.NoPen)
+            self._paint_keys(p, y, layer.anim)
+
+    def _paint_keys(self, p, y, anim):
+        """Small diamonds at the keyframe times of the selected layer / clip."""
+        for t in key_times(anim):
+            x = self.time_to_x(t)
+            if -8 <= x <= self.width() + 8:
+                xi, yi = int(round(x)), y + TRACK_H - 7
+                p.drawPolygon(QPolygon([QPoint(xi, yi - 4), QPoint(xi + 4, yi),
+                                        QPoint(xi, yi + 4), QPoint(xi - 4, yi)]))
 
     def _paint_fades(self, p, s, x0, x1, vy):
         """Show the fade to / from black as dark wedges at the clip ends."""
@@ -957,6 +1030,8 @@ class TimelinePanel(QWidget):
         hl.addWidget(self._track_header("Audio clips"))
         hl.addSpacing(GAP)
         hl.addWidget(self._track_header("Text"))
+        hl.addSpacing(GAP)
+        hl.addWidget(self._track_header("Images"))
 
         body = QHBoxLayout()
         body.setSpacing(0)

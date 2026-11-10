@@ -2,25 +2,37 @@ import os
 import tempfile
 from functools import partial
 
-from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtCore import QEvent, QSettings, Qt, QTimer
 from PySide6.QtGui import QCursor, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QFileDialog, QMainWindow, QMenu, QMessageBox,
+from PySide6.QtWidgets import (QApplication, QFileDialog, QMainWindow, QMenu, QMessageBox,
                                QSplitter, QStackedWidget, QVBoxLayout, QWidget)
 
 from pedio.core.clips import Project
-from pedio.core.export import AudioMixWorker
+from pedio.core.export import AudioMixWorker, ExportSettings
+from pedio.core.history import History
+from pedio.core.keyframes import anim_to_dict
 from pedio.core.layers import build_ass
+from pedio.core.project_io import open_project, save_project
 from pedio.core.transform import ASPECT_PRESETS
 from pedio.core.workers import AudioProbeWorker, ProbeWorker
 from pedio.ui.crop_editor import CropEditor
 from pedio.ui.export_dialog import ExportDialog
+from pedio.ui.export_settings import ExportSettingsDialog
+from pedio.ui.image_overlay import ImageOverlay
 from pedio.ui.overlay_view import TextOverlay
 from pedio.ui.panels.audio_panel import AudioPanel
 from pedio.ui.panels.fade_panel import FadePanel
+from pedio.ui.panels.image_panel import ImagePanel
+from pedio.ui.panels.keyframe_panel import KeyframePanel
+from pedio.ui.panels.speed_panel import SpeedPanel
 from pedio.ui.panels.text_panel import TextPanel
 from pedio.ui.player import AUDIO_EXTS, VIDEO_EXTS, PlayerWidget
+from pedio.ui.settings_dialog import SettingsDialog
+from pedio.ui.theme import apply_theme
 from pedio.ui.timeline import TimelinePanel
 from pedio.ui.toolbar import BottomToolbar
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 
 
 class MainWindow(QMainWindow):
@@ -31,6 +43,16 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self.project = Project(self)   # the clips on the timeline
+        self.history = History(self.project)
+        self.current_path = ""         # the .pedio file ("" = not saved yet)
+        self.export_settings = ExportSettings()
+        self._settings = QSettings("Pedio", "Pedio Editor")
+        self.dark_theme = bool(self._settings.value("dark_theme", True, type=bool))
+        self.hwdec = bool(self._settings.value("hwdec", True, type=bool))
+        self._autosave_path = os.path.join(tempfile.gettempdir(), "pedio_autosave.pedio")
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(60_000)
+        self._autosave_timer.timeout.connect(self._autosave)
         self._queue = []               # files waiting to be read (imported one after another, in order)
         self._probe = None             # the ProbeWorker that is running now
         self._audio_queue = []         # (path, timeline start, src_in, src_out or None) waiting for the audio probe
@@ -46,6 +68,9 @@ class MainWindow(QMainWindow):
         self.audio_panel = None        # created on first use
         self.fade_panel = None         # created on first use
         self.text_panel = None         # created on first use
+        self.image_panel = None        # created on first use
+        self.speed_panel = None        # created on first use
+        self.keyframe_panel = None     # created on first use
         self._text_ass = ""            # temp ASS file the player shows as subtitles
         self._text_sig = None
 
@@ -63,6 +88,11 @@ class MainWindow(QMainWindow):
         self.text_overlay = TextOverlay(self.preview.video)
         self.text_overlay.set_project(self.project)
         self.text_overlay.committed.connect(self.move_text_layer)
+        self.preview.position_changed.connect(self.text_overlay.set_position)
+        self.image_overlay = ImageOverlay(self.preview.video)
+        self.image_overlay.set_project(self.project)
+        self.image_overlay.committed.connect(self.move_image_layer)
+        self.preview.position_changed.connect(self.image_overlay.set_position)
         self.preview.video.installEventFilter(self)
 
         # crop editor: takes the place of the preview while the crop box is open (Video > Crop)
@@ -89,7 +119,14 @@ class MainWindow(QMainWindow):
         self.toolbar.tool_clicked.connect(self.on_tool)
         root.addWidget(self.toolbar)
 
-        QShortcut(QKeySequence(QKeySequence.StandardKey.Open), self, activated=self.import_video)  # Ctrl+O
+        QShortcut(QKeySequence("Ctrl+I"), self, activated=self.import_video)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.Open), self, activated=self.open_project_dialog)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.Save), self, activated=self.save_project_dialog)
+        QShortcut(QKeySequence("Ctrl+Shift+S"), self, activated=self.save_project_as)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.Undo), self, activated=self.undo)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.Redo), self, activated=self.redo)
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self, activated=self.redo)
+        QShortcut(QKeySequence(Qt.Key.Key_K), self, activated=self.open_keyframe_panel)
         # Space (play / pause) is in PlayerWidget
         QShortcut(QKeySequence(Qt.Key.Key_S), self, activated=self.split_at_playhead)
         QShortcut(QKeySequence(Qt.Key.Key_Delete), self, activated=self.delete_clip)
@@ -98,6 +135,9 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.crop_shortcut_cancel)
         QShortcut(QKeySequence(Qt.Key.Key_Return), self, activated=self.crop_shortcut_done)
         QShortcut(QKeySequence(Qt.Key.Key_Enter), self, activated=self.crop_shortcut_done)
+        apply_theme(QApplication.instance(), self.dark_theme)
+        self.preview.set_hwdec(self.hwdec)
+        self._autosave_timer.start()
         self.statusBar().showMessage("Ready")
 
     # ---- import (several files are added one after another at the end of the timeline)
@@ -243,10 +283,52 @@ class MainWindow(QMainWindow):
         if layer is not None:
             self.project.update_text_layer(layer.id, x=x, y=y)
 
+    def open_image_panel(self):
+        if self.image_panel is None:
+            self.image_panel = ImagePanel(self.project, self)
+        self.image_panel.refresh()
+        self.image_panel.show()
+        self.image_panel.raise_()
+        self.image_panel.activateWindow()
+
+    def add_image(self):
+        patterns = " ".join(f"*{ext}" for ext in sorted(IMAGE_EXTS))
+        path, _ = QFileDialog.getOpenFileName(self, "Add image", "", f"Images ({patterns});;All files (*.*)")
+        if not path:
+            return
+        start = round(self.timeline.position(), 2)
+        end = max(start + 3.0, self.project.extent())
+        layer = self.project.add_image_layer(path, start, end)
+        self.project.select_image(layer.id)
+        self.image_overlay.set_position(start)
+        self.open_image_panel()
+
+    def move_image_layer(self, x, y):
+        layer = self.project.image_by_id(self.project.selected_image_id)
+        if layer is not None:
+            self.project.update_image_layer(layer.id, x=x, y=y)
+
+    def open_speed_panel(self):
+        if self.speed_panel is None:
+            self.speed_panel = SpeedPanel(self.project, self)
+        self.speed_panel.refresh()
+        self.speed_panel.show()
+        self.speed_panel.raise_()
+        self.speed_panel.activateWindow()
+
+    def open_keyframe_panel(self):
+        if self.keyframe_panel is None:
+            self.keyframe_panel = KeyframePanel(self.project, self.timeline.position, self)
+        self.keyframe_panel.refresh()
+        self.keyframe_panel.show()
+        self.keyframe_panel.raise_()
+        self.keyframe_panel.activateWindow()
+
     def eventFilter(self, obj, event):
         if obj is self.preview.video and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
-            self.text_overlay.setGeometry(self.preview.video.rect())
-            self.text_overlay.refresh()
+            for overlay in (self.text_overlay, self.image_overlay):
+                overlay.setGeometry(self.preview.video.rect())
+                overlay.refresh()
         return super().eventFilter(obj, event)
 
     def toggle_audio_mute(self):
@@ -266,13 +348,17 @@ class MainWindow(QMainWindow):
         """Any edit: give the player the new clip list (it keeps the playhead position)."""
         self._update_text_preview()
         self.preview.set_edit_list(self.project.play_list(), self.timeline.position())
+        self.image_overlay.refresh()
+        self.image_overlay.set_position(self.timeline.position())
+        self.text_overlay.set_position(self.timeline.position())
         count = len(self.project.clips)
+        name = os.path.basename(self.current_path) if self.current_path else ""
         if count == 0:
-            self.setWindowTitle("Pedio Editor")
+            self.setWindowTitle(f"{name} - Pedio Editor" if name else "Pedio Editor")
         elif count == 1:
-            self.setWindowTitle(f"{os.path.basename(self.project.clips[0].path)} - Pedio Editor")
+            self.setWindowTitle(f"{name or os.path.basename(self.project.clips[0].path)} - Pedio Editor")
         else:
-            self.setWindowTitle(f"{count} clips - Pedio Editor")
+            self.setWindowTitle(f"{name or f'{count} clips'} - Pedio Editor")
         self._schedule_audio_mix()
 
     # ---- preview text: one temporary ASS file, drawn by mpv (the export uses the same kind of file)
@@ -280,7 +366,8 @@ class MainWindow(QMainWindow):
     def _text_signature(layers):
         return tuple((layer.id, layer.text, round(layer.start, 3), round(layer.end, 3),
                       round(layer.x, 4), round(layer.y, 4), layer.size, layer.color,
-                      layer.outline, layer.outline_color, layer.shadow, layer.shadow_color)
+                      layer.outline, layer.outline_color, layer.shadow, layer.shadow_color,
+                      round(layer.opacity, 3), repr(anim_to_dict(layer.anim)))
                      for layer in layers)
 
     def _update_text_preview(self):
@@ -306,9 +393,11 @@ class MainWindow(QMainWindow):
 
     # ---- preview sound: one temporary mix of the video sound + the audio clips
     def _audio_signature(self):
-        clips = tuple((c.path, round(c.src_in, 3), round(c.length, 3)) for c in self.project.play_list())
+        clips = tuple((c.path, round(c.src_in, 3), round(c.length, 3), round(c.speed, 3))
+                      for c in self.project.play_list())
         extra = tuple((c.path, round(c.start, 3), round(c.src_in, 3), round(c.length, 3),
-                       round(c.volume, 3), c.mute, round(c.fade_in, 3), round(c.fade_out, 3))
+                       round(c.volume, 3), c.mute, round(c.fade_in, 3), round(c.fade_out, 3),
+                       repr(anim_to_dict(c.anim)))
                       for c in self.project.audio_clips)
         return clips, extra
 
@@ -392,6 +481,16 @@ class MainWindow(QMainWindow):
     def delete_clip(self):
         if self.crop_open():
             return
+        image = self.project.image_by_id(self.project.selected_image_id)
+        if image is not None:
+            self.project.remove_image_layer(image.id)
+            self.statusBar().showMessage(f"Removed image {os.path.basename(image.path)}")
+            return
+        text = self.project.text_by_id(self.project.selected_text_id)
+        if text is not None:
+            self.project.remove_text_layer(text.id)
+            self.statusBar().showMessage("Removed the text layer")
+            return
         audio = self.project.audio_by_id(self.project.selected_audio_id)
         if audio is not None:
             self.project.remove_audio_clip(audio.id)
@@ -471,7 +570,8 @@ class MainWindow(QMainWindow):
         i, offset = self.project.clip_at(self.timeline.position())
         inside = i >= 0 and self.project.clips[i] is clip
         self.preview.pause()
-        self.crop_editor.start(clip, clip.src_in + (offset if inside else clip.length / 2))
+        source_offset = (offset if inside else clip.length / 2) * clip.speed
+        self.crop_editor.start(clip, clip.src_in + source_offset)
         self.top.setCurrentWidget(self.crop_editor)
         self.toolbar.setEnabled(False)
         self.timeline.setEnabled(False)
@@ -498,25 +598,126 @@ class MainWindow(QMainWindow):
         if self.crop_open() and self.crop_editor.done_btn.isEnabled():
             self.crop_editor.done_btn.click()
 
+    # ---- undo / save / open / autosave (Step 11)
+    def undo(self):
+        if self.history.undo():
+            self.statusBar().showMessage("Undo")
+        else:
+            self.statusBar().showMessage("Nothing to undo")
+
+    def redo(self):
+        if self.history.redo():
+            self.statusBar().showMessage("Redo")
+        else:
+            self.statusBar().showMessage("Nothing to redo")
+
+    def save_project_dialog(self):
+        if self.current_path:
+            self._save_to(self.current_path)
+        else:
+            self.save_project_as()
+
+    def save_project_as(self):
+        default = self.current_path or os.path.splitext(
+            self.project.clips[0].path if self.project.clips else "my_edit")[0] + ".pedio"
+        path, _ = QFileDialog.getSaveFileName(self, "Save project", default,
+                                              "Pedio project (*.pedio);;All files (*.*)")
+        if path:
+            if not path.lower().endswith(".pedio"):
+                path += ".pedio"
+            self._save_to(path)
+
+    def _save_to(self, path):
+        try:
+            save_project(self.project, path)
+        except OSError as e:
+            QMessageBox.warning(self, "Save project", f"Could not save the project:\n{e}")
+            return False
+        self.current_path = path
+        self.statusBar().showMessage(f"Saved {os.path.basename(path)}")
+        self.on_project_changed()
+        return True
+
+    def open_project_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open project", "",
+                                              "Pedio project (*.pedio);;All files (*.*)")
+        if not path:
+            return
+        if (self.project.clips or self.project.audio_clips or self.project.text_layers
+                or self.project.image_layers):
+            answer = QMessageBox.question(self, "Open project",
+                                          "Open this project and replace the current edit?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            open_project(self.project, path)
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "Open project", f"Could not open the project:\n{e}")
+            return
+        self.current_path = path
+        self.history.reset()
+        self._mix_signature = None
+        self.timeline.set_playhead(0.0)
+        self.preview.seek_to(0.0)
+        self.on_project_changed()
+        self.statusBar().showMessage(f"Opened {os.path.basename(path)}")
+
+    def _autosave(self):
+        if not (self.project.clips or self.project.audio_clips or self.project.text_layers
+                or self.project.image_layers):
+            return
+        try:
+            save_project(self.project, self._autosave_path)
+        except OSError:
+            pass
+
+    # ---- settings (dark theme, hardware decoding)
+    def open_settings(self):
+        dialog = SettingsDialog(self.dark_theme, self.hwdec, self)
+        if dialog.exec():
+            self.dark_theme = dialog.dark.isChecked()
+            self.hwdec = dialog.hwdec.isChecked()
+            self._settings.setValue("dark_theme", self.dark_theme)
+            self._settings.setValue("hwdec", self.hwdec)
+            apply_theme(QApplication.instance(), self.dark_theme)
+            self.preview.set_hwdec(self.hwdec)
+            self.statusBar().showMessage("Settings saved")
+
     # ---- export (the same clip list the player plays)
+    def choose_export_settings(self):
+        dialog = ExportSettingsDialog(self.export_settings, self)
+        if dialog.exec():
+            self.export_settings = dialog.values()
+            self.statusBar().showMessage(
+                f"Export: {self.export_settings.format.upper()}, CRF {self.export_settings.crf}")
+
     def export_video(self):
         clips = self.project.play_list()
         if not clips:
             self.statusBar().showMessage("Nothing to export. Import a video first")
             return
         first = self.project.clips[0].path
-        default = os.path.splitext(first)[0] + "_edit.mp4"
-        path, _ = QFileDialog.getSaveFileName(self, "Export video", default, "MP4 video (*.mp4)")
+        fmt = self.export_settings.format if self.export_settings.format in ("mp4", "mkv", "webm") else "mp4"
+        ext = "." + fmt
+        default = os.path.splitext(first)[0] + "_edit" + ext
+        filters = {"mp4": "MP4 video (*.mp4)", "mkv": "Matroska video (*.mkv)",
+                   "webm": "WebM video (*.webm)"}[fmt]
+        path, _ = QFileDialog.getSaveFileName(self, "Export video", default, filters)
         if not path:
             return
-        if not path.lower().endswith(".mp4"):
-            path += ".mp4"
+        if not path.lower().endswith(ext):
+            path = os.path.splitext(path)[0] + ext
         same = os.path.normcase(os.path.abspath(path))
-        if any(os.path.normcase(os.path.abspath(c[0])) == same for c in clips):
+        sources = [c[0] for c in clips] + [c.path for c in self.project.audio_clips]
+        sources += [layer.path for layer in self.project.image_layers]
+        if any(os.path.normcase(os.path.abspath(name)) == same for name in sources):
             QMessageBox.warning(self, "Export", "This file is used by the edit. Choose another file name.")
             return
-        dialog = ExportDialog(clips, path, parent=self, audio_clips=self.project.audio_clips,
-                              text_layers=self.project.text_layers)
+        self.preview.pause()
+        dialog = ExportDialog(clips, path, self.export_settings, parent=self,
+                              audio_clips=self.project.audio_clips,
+                              text_layers=self.project.text_layers,
+                              image_layers=self.project.image_layers)
         dialog.exec()
         if dialog.succeeded:
             self.statusBar().showMessage(f"Exported {os.path.basename(path)}")
@@ -570,6 +771,7 @@ class MainWindow(QMainWindow):
             "Rotate": self.rotate_clip,
             "Flip H": lambda: self.flip_clip(True),
             "Flip V": lambda: self.flip_clip(False),
+            "Speed": self.open_speed_panel,
             "Add Audio": self.import_audio,
             "Extract Audio": self.extract_audio,
             "Volume": self.open_audio_panel,
@@ -579,6 +781,15 @@ class MainWindow(QMainWindow):
             "Fade Out": self.open_fade_panel,
             "Add Text": self.add_text,
             "Edit Text": self.edit_text,
+            "Add Image": self.add_image,
+            "Image Settings": self.open_image_panel,
+            "Keyframes": self.open_keyframe_panel,
+            "Undo": self.undo,
+            "Redo": self.redo,
+            "Save Project": self.save_project_dialog,
+            "Open Project": self.open_project_dialog,
+            "Export Settings": self.choose_export_settings,
+            "Settings": self.open_settings,
             "Export Video": self.export_video,
         }
         action = actions.get(tool)
@@ -588,6 +799,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"{category} > {tool} (not implemented yet)")
 
     def closeEvent(self, event):
+        self._autosave_timer.stop()
         self._queue.clear()
         self._audio_queue.clear()
         if self._probe is not None:
