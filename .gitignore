@@ -27,6 +27,7 @@ Thumbs.db
 *.log
 cache/
 temp/
+error.txt
 
 # Media (test videos / exports)
 *.mp4

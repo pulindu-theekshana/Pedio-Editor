@@ -294,14 +294,22 @@ class CropEditor(QWidget):
         worker = FrameWorker(clip.path, t, video_filters(clip.transform, with_crop=False), self)
         worker.frame_ready.connect(self._on_frame)
         worker.failed.connect(self._on_failed)
+        worker.finished.connect(self._on_worker_finished)   # clear our reference BEFORE Qt deletes the object
         worker.finished.connect(worker.deleteLater)
         self._worker = worker
         worker.start()
 
+    def _on_worker_finished(self):
+        if self.sender() is self._worker:
+            self._worker = None
+
     def shutdown(self):
         worker, self._worker = self._worker, None
         if worker is not None:
-            worker.wait(5000)
+            try:
+                worker.wait(5000)
+            except RuntimeError:      # the C++ object was already deleted by deleteLater
+                pass
 
     def _on_frame(self, image):
         if self.sender() is not self._worker:      # an old job (the editor was closed and opened again)
