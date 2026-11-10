@@ -7,11 +7,12 @@ import json
 import os
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 
 from PySide6.QtCore import QThread, Signal
 
+from pedio.core.audio import AudioClip
 from pedio.core.clips import Segment
 from pedio.core.transform import output_size, stream_rotation, video_filters
 from pedio.core.workers import CREATE_NO_WINDOW
@@ -77,16 +78,44 @@ def probe_source(path):
     return SourceInfo(width, height, fps, has_audio)
 
 
+def probe_audio(path):
+    """Check that a source file has an audio stream. Raises ExportError."""
+    ffprobe = find_tool("ffprobe")
+    if not ffprobe:
+        raise ExportError("ffprobe was not found. Run setup.bat again.")
+    cmd = [ffprobe, "-v", "error", "-show_streams", "-of", "json", path]
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=30, creationflags=CREATE_NO_WINDOW)
+        streams = json.loads(out.stdout.decode("utf-8", "replace") or "{}").get("streams", [])
+    except Exception:
+        streams = []
+    if not any(s.get("codec_type") == "audio" for s in streams):
+        raise ExportError(f"Could not read audio from {os.path.basename(path)}. Was the file moved or deleted?")
+
+
+def _copy_audio_clips(audio_clips):
+    """Accept AudioClip instances or their field tuples, and snapshot the result."""
+    return [replace(clip) if isinstance(clip, AudioClip) else AudioClip(*clip) for clip in audio_clips]
+
+
+def _active_audio_clips(audio_clips, duration):
+    """Tracks that can contribute audible samples to an export of ``duration`` seconds."""
+    return [clip for clip in audio_clips if not clip.mute and clip.volume > 0
+            and clip.length > 0 and clip.start < duration]
+
+
 # ---------------------------------------------------------------------- command
-def build_command(ffmpeg, clips, sources, out_path, settings):
+def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=()):
     """The ffmpeg command line. clips = [Segment] (3-tuples work too), sources = {path: SourceInfo}.
 
     Every clip is cut with input seeking (-ss / -t), mirrored / rotated / cropped (video_filters, the same
     filters the preview uses), brought to one size / frame rate / audio format, then joined with the
     concat filter. A clip without sound gets silence of the same length.
     The output size is the size of the first clip after its transform; the other clips are fitted into it.
+    Extra audio clips are placed at their timeline start and mixed over the video's original sound.
     """
     clips = [Segment(*c) for c in clips]
+    audio_clips = _active_audio_clips(_copy_audio_clips(audio_clips), sum(c.length for c in clips))
     first = sources[clips[0].path]
     width, height = settings.size or output_size(first.width, first.height, clips[0].transform)
     width, height = width - width % 2, height - height % 2          # yuv420p needs even numbers
@@ -109,7 +138,21 @@ def build_command(ffmpeg, clips, sources, out_path, settings):
             audio = f"anullsrc=r={AUDIO_RATE}:cl=stereo"
         parts.append(f"{audio},atrim=duration={length:.6f},asetpts=PTS-STARTPTS[a{i}]")
         joined += f"[v{i}][a{i}]"
-    parts.append(f"{joined}concat=n={len(clips)}:v=1:a=1[v][a]")
+    parts.append(f"{joined}concat=n={len(clips)}:v=1:a=1[v][basea]")
+
+    if audio_clips:
+        mixed = "[basea]"
+        for i, clip in enumerate(audio_clips, start=len(clips)):
+            cmd += ["-ss", f"{clip.src_in:.6f}", "-t", f"{clip.length:.6f}", "-i", clip.path]
+            delay_ms = max(0, round(clip.start * 1000))
+            parts.append(
+                f"[{i}:a:0]aresample={AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                f"atrim=duration={clip.length:.6f},asetpts=PTS-STARTPTS,volume={clip.volume:.6f},"
+                f"adelay={delay_ms}:all=1[extra{i}]")
+            mixed += f"[extra{i}]"
+        parts.append(f"{mixed}amix=inputs={len(audio_clips) + 1}:duration=first:normalize=0[a]")
+    else:
+        parts.append("[basea]anull[a]")
 
     cmd += [
         "-filter_complex", ";".join(parts), "-map", "[v]", "-map", "[a]",
@@ -142,9 +185,10 @@ class ExportWorker(QThread):
     failed = Signal(str)         # message for the user
     cancelled = Signal()
 
-    def __init__(self, clips, out_path, settings=None, parent=None):
+    def __init__(self, clips, out_path, settings=None, parent=None, audio_clips=None):
         super().__init__(parent)
         self.clips = [Segment(*c) for c in clips]     # copy: later edits do not change a running export
+        self.audio_clips = _copy_audio_clips(audio_clips or [])
         self.out_path = out_path
         self.settings = settings or ExportSettings()
         self._stop = False
@@ -183,8 +227,17 @@ class ExportWorker(QThread):
                     return self._cancel(part)
                 sources[seg.path] = probe_source(seg.path)
         total = sum(seg.length for seg in self.clips)
+        audio_clips = _active_audio_clips(self.audio_clips, total)
+        for clip in audio_clips:
+            if clip.path in sources:
+                if not sources[clip.path].has_audio:
+                    raise ExportError(f"Could not read audio from {os.path.basename(clip.path)}.")
+            else:
+                if self._stop:
+                    return self._cancel(part)
+                probe_audio(clip.path)
 
-        cmd = build_command(ffmpeg, self.clips, sources, part, self.settings)
+        cmd = build_command(ffmpeg, self.clips, sources, part, self.settings, audio_clips)
         with tempfile.TemporaryFile() as errors:      # a file, so ffmpeg can never block on a full pipe
             self._proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=errors, stdin=subprocess.DEVNULL,

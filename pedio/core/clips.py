@@ -5,6 +5,7 @@ from typing import NamedTuple
 
 from PySide6.QtCore import QObject, Signal
 
+from pedio.core.audio import AudioClip
 from pedio.core.transform import Transform, centered_crop
 
 MIN_CLIP = 0.1  # shortest clip allowed, in seconds
@@ -52,6 +53,7 @@ class Project(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.clips = []
+        self.audio_clips = []
         self.selected_id = 0      # 0 = nothing selected
 
     # ------------------------------------------------------------------ reading
@@ -116,6 +118,22 @@ class Project(QObject):
         self.clips.append(clip)
         self.changed.emit()
         return clip
+
+    def add_audio_clip(self, path, start, src_in, src_out, volume=1.0, mute=False):
+        """Place a range of an audio file on the timeline. Returns the new AudioClip."""
+        clip = AudioClip(path, float(start), float(src_in), float(src_out), float(volume), bool(mute))
+        self.audio_clips.append(clip)
+        self.changed.emit()
+        return clip
+
+    def remove_audio_clip(self, audio_id):
+        """Remove an audio clip by id. Returns True when a clip was removed."""
+        for i, clip in enumerate(self.audio_clips):
+            if clip.id == audio_id:
+                del self.audio_clips[i]
+                self.changed.emit()
+                return True
+        return False
 
     def split(self, t):
         """Cut the clip under timeline time t in two. Both halves keep the clip's transform (and any later per-clip effect)."""
