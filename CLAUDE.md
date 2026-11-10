@@ -29,8 +29,9 @@ python main.py
 First time only: `setup.bat` (venv, pip, libmpv, vulkan-1.dll, ffmpeg into bin\, then `scripts\check_setup.py`).
 
 ## Build order (details + mini-steps: docs/STEPS.md)
-- Done: 1 setup, 2 import + player, 3 timelines, 4 trim / split / delete / reorder / snap, 5 export.
-- CURRENT: 6 picture (rotate, flip, aspect ratio, crop). Code is on branch `step6-wip`, untested, not merged.
+- Done: 1 setup, 2 import + player, 3 timelines, 4 trim / split / delete / reorder / snap.
+- CURRENT: 5 export. The code is on main, but the owner says it did NOT work on Windows (it was only tested on Linux). Verify + fix it first (mini-step 5a). Do not start Step 6 before 5a is done.
+- NEXT: 6 picture (rotate, flip, aspect ratio, crop). Code is on branch `step6-wip`, untested, not merged.
 - Basic: 7 audio | 8 video fades | 9 text overlay | 10 speed + export settings | 11 undo, save / open, autosave, shortcuts | 12 dark theme, hardware decoding, icon, .exe
 - Advanced (after 12): 13 image overlays | 14-15 keyframes | 16-18 smart masking | 19 .exe with the AI parts
 

@@ -10,9 +10,13 @@ No test scripts (py_compile only). Commit as me and push. Then tick it and give 
 ```
 
 ## Done
-1 setup + layout, 2 import + player, 3 timelines, 4 trim / split / delete / reorder / snap, 5 export.
+1 setup + layout, 2 import + player, 3 timelines, 4 trim / split / delete / reorder / snap.
 
-## Step 6 - Picture: rotate, flip, aspect ratio, crop
+## Step 5 - Export (NOT done: did not work for the owner on Windows)
+The code is on main (core/export.py, ui/export_dialog.py, `export_video` in ui/main_window.py). A static read found no obvious bug; it was only ever tested on Linux.
+- [ ] 5a Owner runs on main: `python main.py 2> error.txt`, imports a short video, Toolbar > Export > Export Video. He pastes the text the export window shows + `type error.txt`. Fix only that. Then tick, update the notes, push.
+
+## Step 6 - Picture: rotate, flip, aspect ratio, crop (start only after 5a)
 Code is written on branch `step6-wip` (compiles, NOT tested, not merged). Do not rewrite it: test it, fix only what fails.
 - [ ] 6a Test rotate, flip, aspect presets (preview = export). Files: core/transform.py, core/export.py, ui/player.py, ui/main_window.py
 - [ ] 6b Test the crop box + crop in export; update CLAUDE.md (folder structure + APIs); merge `step6-wip` into main. Files: ui/crop_editor.py, core/clips.py
