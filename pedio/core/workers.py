@@ -12,6 +12,7 @@ from array import array
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
 
+from pedio.core.transform import stream_rotation
 from pedio.paths import find_tool
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # no black console flash on Windows
@@ -27,10 +28,10 @@ def thumb_step(duration, target=150):
 
 
 class ProbeWorker(QThread):
-    """Asks ffprobe for the length of a file and checks that it has a video stream."""
+    """Asks ffprobe for the length, picture size and phone rotation of a file, and checks that it has a video stream."""
 
-    done = Signal(str, float)     # path, duration in seconds
-    failed = Signal(str, str)     # path, message
+    done = Signal(str, float, int, int, int)   # path, duration (s), width, height (as a player shows it), clockwise turn from metadata
+    failed = Signal(str, str)                  # path, message
 
     def __init__(self, path, parent=None):
         super().__init__(parent)
@@ -41,22 +42,59 @@ class ProbeWorker(QThread):
         if not ffprobe:
             self.failed.emit(self.path, "ffprobe was not found. Run setup.bat again.")
             return
-        cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration:stream=codec_type",
-               "-of", "json", self.path]
+        cmd = [ffprobe, "-v", "error", "-show_format", "-show_streams", "-of", "json", self.path]
         try:
             out = subprocess.run(cmd, capture_output=True, timeout=30, creationflags=CREATE_NO_WINDOW)
             info = json.loads(out.stdout.decode("utf-8", "replace") or "{}")
-            kinds = [s.get("codec_type") for s in info.get("streams", [])]
+            streams = info.get("streams", [])
             duration = float(info.get("format", {}).get("duration", 0))
         except Exception:
-            kinds, duration = [], 0.0
+            streams, duration = [], 0.0
+        video = next((s for s in streams if s.get("codec_type") == "video"
+                      and s.get("width") and not s.get("disposition", {}).get("attached_pic")), None)
         name = os.path.basename(self.path)
-        if "video" not in kinds:
+        if video is None:
             self.failed.emit(self.path, f"Could not open {name}. It may not be a valid video.")
         elif duration <= 0:
             self.failed.emit(self.path, f"Could not read the length of {name}.")
         else:
-            self.done.emit(self.path, duration)
+            width, height = int(video["width"]), int(video["height"])
+            rotation = stream_rotation(video)
+            if rotation % 180 == 90:
+                width, height = height, width      # the picture as a player shows it
+            self.done.emit(self.path, duration, width, height, rotation)
+
+
+class FrameWorker(QThread):
+    """One picture of a clip at `t` seconds with the given filters (mirror / rotate, no crop), at most 720 px tall.
+    The crop box is drawn on this picture."""
+
+    frame_ready = Signal(QImage)
+    failed = Signal(str)
+
+    def __init__(self, path, t, filters, parent=None):
+        super().__init__(parent)
+        self.path = path
+        self.t = t
+        self.filters = list(filters)
+
+    def run(self):
+        ffmpeg = find_tool("ffmpeg")
+        if not ffmpeg:
+            self.failed.emit("ffmpeg was not found. Run setup.bat again.")
+            return
+        vf = ",".join(self.filters + ["scale=-2:if(gt(ih\\,720)\\,720\\,ih)"])   # a backslash escapes a comma for ffmpeg
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-ss", f"{max(self.t, 0.0):.3f}",
+               "-i", self.path, "-frames:v", "1", "-vf", vf, "-f", "image2pipe", "-c:v", "png", "pipe:1"]
+        try:
+            out = subprocess.run(cmd, capture_output=True, timeout=60, creationflags=CREATE_NO_WINDOW)
+            image = QImage.fromData(out.stdout, "PNG")
+        except Exception:
+            image = QImage()
+        if image.isNull():
+            self.failed.emit("Could not read a picture from this clip.")
+        else:
+            self.frame_ready.emit(image)
 
 
 class ThumbnailWorker(QThread):

@@ -1,12 +1,21 @@
 """Video preview: embedded mpv + play/pause, seek bar, time display, volume and mute.
 
-The player does not open files itself: it plays an edit list [(path, start, length), ...]
-(the clips on the timeline) as one mpv "edl://" playlist, so playback runs across clips.
+The player does not open files itself: it plays an edit list (`Project.play_list()`: Segment(path, start, length,
+transform, ...), the clips on the timeline) as one mpv "edl://" playlist, so playback runs across clips.
+
+Mirror / rotate / crop (core/transform.py) are mpv video filters, `vf=lavfi=[...]`, the same filters the export
+uses. mpv has ONE filter chain for the whole playlist, so the player switches it when the playhead moves into a
+clip with another transform (`_sync_look`). Seeking and pausing show the right picture; during live playback the
+first few frames after a cut between two differently transformed clips can still show the old look.
 """
+import bisect
+
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QSlider,
                                QStackedLayout, QStyle, QVBoxLayout, QWidget)
+
+from pedio.core.transform import video_filters
 
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".mov", ".avi", ".webm", ".wmv", ".flv", ".m4v",
@@ -31,6 +40,28 @@ def edl_url(segments):
     for path, start, length in segments:
         parts.append(f"%{len(path.encode('utf-8'))}%{path},{start:.3f},{length:.3f}")
     return "edl://" + ";".join(parts)
+
+
+def merge_sources(segments):
+    """[Segment] -> [(path, start, length)] for mpv. Pieces that continue each other in the same file are one
+    piece (the transform does not matter here), so changing a transform never reloads the playlist."""
+    out = []
+    for s in segments:
+        if out and out[-1][0] == s.path and abs(out[-1][1] + out[-1][2] - s.start) < 1e-6:
+            path, start, length = out[-1]
+            out[-1] = (path, start, length + s.length)
+        else:
+            out.append((s.path, s.start, s.length))
+    return [(p, round(st, 3), round(n, 3)) for p, st, n in out]
+
+
+def look_schedule(segments):
+    """[(end_time, (transform, meta_rotation))] in timeline seconds: which look is on screen until end_time."""
+    out, t = [], 0.0
+    for s in segments:
+        t += s.length
+        out.append((t, (s.transform, s.meta_rotation)))
+    return out
 
 
 class SeekSlider(QSlider):
@@ -83,7 +114,9 @@ class PlayerWidget(QWidget):
         self._duration = 0.0
         self._muted = False
         self._last_path = ""
-        self._segments = []          # what mpv has loaded: [(path, start, length)]
+        self._sources = []           # what mpv has loaded: [(path, start, length)]
+        self._looks = []             # [(end_time, (transform, meta_rotation))]: how each part of the timeline is shown
+        self._applied_look = None    # the look mpv's filters are set to now
         self._seek_after_load = None  # timeline position to restore once the new list is loaded
         self._resume = False         # start playing again after the reload
         self._settling = False       # ignore mpv's time updates until the position is restored
@@ -188,7 +221,9 @@ class PlayerWidget(QWidget):
                 loglevel="error",
                 log_handler=lambda level, prefix, text: print(f"[mpv {level}] {prefix}: {text.strip()}"),
             )
-            nice_to_have = dict(hwdec="auto-safe", drag_and_drop="no")
+            # "-copy": the GPU decodes, the frames are copied back to normal memory. Needed for the vf=lavfi filters
+            # (rotate / flip / crop): with plain "auto-safe" the frames stay on the GPU (d3d11) and the filter fails.
+            nice_to_have = dict(hwdec="auto-copy-safe", drag_and_drop="no")
             try:
                 self.player = mpv.MPV(**options, **nice_to_have)
             except Exception:  # an option this libmpv build does not know
@@ -227,19 +262,22 @@ class PlayerWidget(QWidget):
 
     # ------------------------------------------------------------------ public API
     def set_edit_list(self, segments, position=0.0):
-        """Play these (path, start, length) pieces one after another. Does nothing if the list did not
-        change. After a reload the player goes back to `position` (timeline seconds) and keeps playing if it was."""
-        segments = [(p, round(s, 3), round(n, 3)) for p, s, n in segments]
-        if segments == self._segments:
+        """Play these Segments one after another. After a reload the player goes back to `position` (timeline
+        seconds) and keeps playing if it was. If only a transform changed (rotate / flip / crop) nothing is
+        reloaded: the video filters are changed on the fly."""
+        sources = merge_sources(segments)
+        self._looks = look_schedule(segments)
+        if sources == self._sources:
+            self._sync_look(position)
             return
-        self._segments = segments
-        if not segments:
+        self._sources = sources
+        if not sources:
             self._unload()
             return
         if not self._ensure_player():
-            self._segments = []
+            self._sources = []
             return
-        total = sum(n for _p, _s, n in segments)
+        total = sum(n for _p, _s, n in sources)
         if self._settling:  # reloaded again before the last reload finished: keep its "resume" choice
             was_playing = self._resume
         else:
@@ -248,11 +286,48 @@ class PlayerWidget(QWidget):
         self._resume = bool(was_playing)
         self._settling = True
         self._generation += 1
-        self._last_path = segments[0][0]
+        self._last_path = sources[0][0]
+        self._sync_look(self._seek_after_load)  # the filters are global: set them for where we will be
         self.player.pause = True  # show the first frame, wait for Play
-        self.player.play(edl_url(segments))
+        self.player.play(edl_url(sources))
+
+    def pause(self):
+        if self.player is not None and self._has_file:
+            self.player.pause = True
+
+    def refresh(self):
+        """Draw the current picture again (after the video widget was hidden and shown)."""
+        if self.player is not None and self._has_file and self._seek_after_load is None:
+            self.player.command("seek", f"{self.position():.3f}", "absolute+exact")
+
+    def _look_at(self, t):
+        ends = [end for end, _look in self._looks]
+        i = min(bisect.bisect_right(ends, t), len(self._looks) - 1)
+        return self._looks[i][1]
+
+    def _sync_look(self, t):
+        """Set mpv's video filters to the look of the clip at timeline time t (if they are not already)."""
+        if self.player is None or not self._looks:
+            return
+        look = self._look_at(t)
+        if look == self._applied_look:
+            return
+        self._applied_look = look
+        transform, meta_rotation = look
+        # no transform: mpv shows the picture as before (it turns phone videos by itself, no filter needed).
+        # with a transform: the filters do everything, including the phone rotation, so mpv must not rotate too.
+        filters = [] if transform.is_default else video_filters(transform, meta_rotation)
+        try:
+            self.player.video_rotate = "no" if filters else "0"
+            if filters:
+                self.player.command("vf", "set", "lavfi=[" + ",".join(filters) + "]")
+            else:
+                self.player.command("vf", "clr", "")
+        except Exception as e:
+            print(f"[player] could not set the video filters: {e}")
 
     def _unload(self):
+        self._applied_look = None
         self._seek_after_load = None
         self._resume = False
         self._settling = False
@@ -283,6 +358,7 @@ class PlayerWidget(QWidget):
     def seek_to(self, seconds, exact=True):
         if self.player is None or not self._has_file:
             return
+        self._sync_look(max(seconds, 0.0))     # show the target with the look of the clip it is in
         if self._seek_after_load is not None:  # a reload is still running: remember the target instead
             self._seek_after_load = max(seconds, 0.0)
             return
@@ -325,6 +401,7 @@ class PlayerWidget(QWidget):
     def _on_time(self, t):
         if t is None or self._settling:
             return
+        self._sync_look(t)
         if not self.seek.isSliderDown():
             self.seek.setValue(int(t * 1000))
             self.time_label.setText(f"{fmt_time(t)} / {fmt_time(self._duration)}")
@@ -347,6 +424,7 @@ class PlayerWidget(QWidget):
         self.stack.setCurrentWidget(self.video)
         if self._seek_after_load is not None:  # a reload: go back to where we were
             t, self._seek_after_load = self._seek_after_load, None
+            self._sync_look(t)
             if t > 0.0 and self.player is not None:
                 self.player.command("seek", f"{t:.3f}", "absolute+exact")
             QTimer.singleShot(200, lambda g=self._generation: self._end_settle(g))
@@ -369,6 +447,7 @@ class PlayerWidget(QWidget):
             self._seek_after_load = None
             self._resume = False
             self._settling = False
-            self._segments = []   # so the next edit loads the list again
+            self._sources = []    # so the next edit loads the list again
+            self._applied_look = None
             self._reset_state()
             self.load_failed.emit("Could not play the timeline. One of the clips may not be a valid video.")

@@ -1,7 +1,7 @@
 """Export the timeline to an MP4 file with ffmpeg. No widgets here: a pure command builder + a QThread worker.
 
-The clip list is `Project.play_list()` = [(path, start, length)], the same list the player plays,
-so what you see in the preview is what you get in the file.
+The clip list is `Project.play_list()` = [Segment(path, start, length, transform, ...)], the same list the
+player plays, so what you see in the preview is what you get in the file.
 """
 import json
 import os
@@ -12,6 +12,8 @@ from fractions import Fraction
 
 from PySide6.QtCore import QThread, Signal
 
+from pedio.core.clips import Segment
+from pedio.core.transform import output_size, stream_rotation, video_filters
 from pedio.core.workers import CREATE_NO_WINDOW
 from pedio.paths import find_tool
 
@@ -29,7 +31,7 @@ class ExportSettings:
     crf: int = 20                 # x264 quality: lower = better + bigger file
     preset: str = "veryfast"      # x264 speed / size trade-off
     audio_bitrate: str = "192k"
-    size: tuple = None            # (width, height); None = size of the first clip
+    size: tuple = None            # (width, height); None = size of the first clip (after its crop / rotate)
     fps: Fraction = None          # None = frame rate of the first clip
 
 
@@ -51,22 +53,6 @@ def _fraction(text):
     return value if value > 0 else None
 
 
-def _rotation(stream):
-    """Rotation in degrees from the file's metadata (phone videos): old 'rotate' tag or newer side data."""
-    degrees = 0
-    try:
-        degrees = int(float(stream.get("tags", {}).get("rotate", 0)))
-    except (TypeError, ValueError):
-        pass
-    for side in stream.get("side_data_list", []):
-        if "rotation" in side:
-            try:
-                degrees = int(float(side["rotation"]))
-            except (TypeError, ValueError):
-                pass
-    return degrees
-
-
 def probe_source(path):
     """Size, frame rate and audio of a file (ffprobe). Raises ExportError."""
     ffprobe = find_tool("ffprobe")
@@ -84,7 +70,7 @@ def probe_source(path):
     if video is None:
         raise ExportError(f"Could not read {name}. Was the file moved or deleted?")
     width, height = int(video["width"]), int(video["height"])
-    if abs(_rotation(video)) % 180 == 90:
+    if stream_rotation(video) % 180 == 90:
         width, height = height, width          # ffmpeg turns the picture upright before the filters
     fps = _fraction(video.get("avg_frame_rate")) or _fraction(video.get("r_frame_rate")) or DEFAULT_FPS
     has_audio = any(s.get("codec_type") == "audio" for s in streams)
@@ -93,22 +79,28 @@ def probe_source(path):
 
 # ---------------------------------------------------------------------- command
 def build_command(ffmpeg, clips, sources, out_path, settings):
-    """The ffmpeg command line. clips = [(path, start, length)], sources = {path: SourceInfo}.
+    """The ffmpeg command line. clips = [Segment] (3-tuples work too), sources = {path: SourceInfo}.
 
-    Every clip is cut with input seeking (-ss / -t), brought to one size / frame rate / audio format,
-    then joined with the concat filter. A clip without sound gets silence of the same length.
+    Every clip is cut with input seeking (-ss / -t), mirrored / rotated / cropped (video_filters, the same
+    filters the preview uses), brought to one size / frame rate / audio format, then joined with the
+    concat filter. A clip without sound gets silence of the same length.
+    The output size is the size of the first clip after its transform; the other clips are fitted into it.
     """
-    first = sources[clips[0][0]]
-    width, height = settings.size or (first.width, first.height)
+    clips = [Segment(*c) for c in clips]
+    first = sources[clips[0].path]
+    width, height = settings.size or output_size(first.width, first.height, clips[0].transform)
     width, height = width - width % 2, height - height % 2          # yuv420p needs even numbers
     fps = settings.fps or first.fps
 
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
     parts, joined = [], ""
-    for i, (path, start, length) in enumerate(clips):
-        cmd += ["-ss", f"{start:.6f}", "-t", f"{length:.6f}", "-i", path]
+    for i, seg in enumerate(clips):
+        path, length = seg.path, seg.length
+        cmd += ["-ss", f"{seg.start:.6f}", "-t", f"{length:.6f}", "-i", path]
+        # ffmpeg turns phone videos upright by itself, so meta_rotation stays 0 here (the player has to do it)
+        look = "".join(f + "," for f in video_filters(seg.transform))
         parts.append(
-            f"[{i}:v:0]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"[{i}:v:0]{look}scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
             f"fps={fps.numerator}/{fps.denominator},format=yuv420p,setpts=PTS-STARTPTS[v{i}]")
         if sources[path].has_audio:
@@ -152,7 +144,7 @@ class ExportWorker(QThread):
 
     def __init__(self, clips, out_path, settings=None, parent=None):
         super().__init__(parent)
-        self.clips = list(clips)                      # copy: later edits do not change a running export
+        self.clips = [Segment(*c) for c in clips]     # copy: later edits do not change a running export
         self.out_path = out_path
         self.settings = settings or ExportSettings()
         self._stop = False
@@ -185,12 +177,12 @@ class ExportWorker(QThread):
         if not self.clips:
             raise ExportError("There is nothing to export.")
         sources = {}
-        for path, _, _ in self.clips:
-            if path not in sources:
+        for seg in self.clips:
+            if seg.path not in sources:
                 if self._stop:
                     return self._cancel(part)
-                sources[path] = probe_source(path)
-        total = sum(length for _, _, length in self.clips)
+                sources[seg.path] = probe_source(seg.path)
+        total = sum(seg.length for seg in self.clips)
 
         cmd = build_command(ffmpeg, self.clips, sources, part, self.settings)
         with tempfile.TemporaryFile() as errors:      # a file, so ffmpeg can never block on a full pipe
