@@ -221,7 +221,9 @@ class PlayerWidget(QWidget):
                 loglevel="error",
                 log_handler=lambda level, prefix, text: print(f"[mpv {level}] {prefix}: {text.strip()}"),
             )
-            nice_to_have = dict(hwdec="auto-safe", drag_and_drop="no")
+            # "-copy": the GPU decodes, the frames are copied back to normal memory. Needed for the vf=lavfi filters
+            # (rotate / flip / crop): with plain "auto-safe" the frames stay on the GPU (d3d11) and the filter fails.
+            nice_to_have = dict(hwdec="auto-copy-safe", drag_and_drop="no")
             try:
                 self.player = mpv.MPV(**options, **nice_to_have)
             except Exception:  # an option this libmpv build does not know
