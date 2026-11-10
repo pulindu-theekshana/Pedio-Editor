@@ -17,6 +17,8 @@ python main.py
 - Click a clip to select it. Drag its yellow edges to trim, drag the clip itself to reorder.
 - Space = play / pause, S = split at the playhead, Del = delete the selected clip, [ and ] = cut the start / end of the clip at the playhead.
 - Snap (above the timeline) pulls edges to the playhead and to other clips.
+- Mouse on the timeline: click a clip = select + move the playhead, drag on the ruler = move the playhead, Ctrl+wheel = zoom.
+- Del deletes the selected clip (or the clip under the playhead if none is selected). The build plan is in `docs/STEPS.md`.
 
 ## Export
 - Toolbar > Export > Export Video. Pick a file name; the whole timeline is saved as an MP4 (H.264 + AAC).

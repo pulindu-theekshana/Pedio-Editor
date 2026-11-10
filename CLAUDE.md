@@ -1,17 +1,25 @@
 # Pedio Editor - CLAUDE.md
 
-Read this first in a new chat. Update it at the end of every step (keep it short).
+Read this first in a new chat, then ONLY the mini-step you were given in `docs/STEPS.md`. Keep this file short.
 
 ## Project
 Simple video editor for Windows. Python 3.10-3.13 + PySide6 + python-mpv (libmpv) + FFmpeg.
-Owner: Pulindu (some dev knowledge; free Claude plan, so work is split into steps, one chat per step).
+Owner: Pulindu (some dev knowledge; free Claude plan: a 5-hour usage limit, so work is split into small mini-steps, one chat each).
 
 ## How to answer the owner (his rules)
 - Short, simple answers. Do not over-explain.
 - Give cmd-prompt commands to run.
 - Code edits: file name + "before" / "after" lines. If a file has 3 or fewer edit spots, never resend the whole file.
 - Send a whole file only for new files or big rewrites (when more than 3 spots change). Ask before changing the whole project. No zip files except the first creation.
-- After each step: update this file, tell him which files changed.
+- Commits: author and committer = pulindu-theekshana <tpulindu@gmail.com>. No Claude author, co-author or Claude lines in commit messages or PR text.
+
+## Work rules (save tokens, never lose work)
+- One chat = ONE mini-step from `docs/STEPS.md`. Do not start the next one.
+- Read this file + only the files listed in the mini-step. Use grep and line ranges for the rest; never read a whole big file for one function.
+- No test scripts, no Xvfb, no mpv or ffmpeg runs on Linux. Only `python -m py_compile <changed files>`. The owner tests on Windows and pastes the last ~15 lines of any error.
+- Commit + push at the end of every mini-step. If it is unfinished or untested, push a `stepN-wip` branch instead of main. Stop at a clean point if the mini-step turns out bigger than planned, and say what is left.
+- At the end: tick the mini-step in `docs/STEPS.md`; update this file only if the structure or an API changed; tell him which files changed; give the cmd commands (`git pull`, `python main.py`) and a 3-line prompt for the next chat.
+- Also write this file to the project doc `claude/CLAUDE.md` when it changes.
 
 ## Run
 ```
@@ -20,12 +28,20 @@ python main.py
 ```
 First time only: `setup.bat` (venv, pip, libmpv, vulkan-1.dll, ffmpeg into bin\, then `scripts\check_setup.py`).
 
+## Build order (details + mini-steps: docs/STEPS.md)
+- Done: 1 setup, 2 import + player, 3 timelines, 4 trim / split / delete / reorder / snap.
+- CURRENT: 5 export. The code is on main, but the owner says it did NOT work on Windows (it was only tested on Linux). Verify + fix it first (mini-step 5a). Do not start Step 6 before 5a is done.
+- NEXT: 6 picture (rotate, flip, aspect ratio, crop). Code is on branch `step6-wip`, untested, not merged.
+- Basic: 7 audio | 8 video fades | 9 text overlay | 10 speed + export settings | 11 undo, save / open, autosave, shortcuts | 12 dark theme, hardware decoding, icon, .exe
+- Advanced (after 12): 13 image overlays | 14-15 keyframes | 16-18 smart masking | 19 .exe with the AI parts
+
 ## Folder structure
 ```
 pedio-editor/
   main.py              entry point: setup_paths() BEFORE any mpv import, then starts the app
   CLAUDE.md  README.md  requirements.txt  .gitignore
   setup.bat  run.bat
+  docs/STEPS.md        build plan: mini-steps with files to read / touch
   mpv-2.dll, vulkan-1.dll   (root, gitignored, downloaded by setup)
   bin/                 ffmpeg.exe, ffprobe.exe (gitignored)
   scripts/
@@ -60,10 +76,9 @@ New tool dialogs/panels (crop, audio, text, export settings) -> `pedio/ui/` (a `
 - `Project.changed` handler order matters: TimelineView (clamps the playhead) first, then `MainWindow.on_project_changed` (reloads the player).
 - No gaps on the timeline: clips are always joined end to end (delete / trim close the gap).
 - The player reloads mpv only when `Project.play_list()` changes; neighbours that continue each other are merged, so a plain split does not reload.
-- Window shortcuts need an active window (under Xvfb with no window manager call `QApplication.setActiveWindow(win)` in tests).
 - Export uses `Project.play_list()` (same list as the player). Each segment is cut with input seeking (`-ss/-t -i`), scaled/padded to the first clip's size + fps, joined with `concat`; a clip without audio gets `anullsrc` silence. The file is written as `<name>.mp4.part` and renamed when complete.
 - New per-clip effects (crop, rotate, fades, text, speed) go into the per-segment filter chain in `build_command()`; new options go into `ExportSettings`.
-- Keep every effect as plain data on the clip / layer, applied in ONE place for the preview and ONE place for the export. Then keyframes (Steps 14-15) only add "value at time t" and nothing has to be rewritten.
+- Keep every effect as plain data on the clip / layer, applied in ONE place for the preview and ONE place for the export (one source of truth). Then keyframes (Steps 14-15) only add "value at time t" and nothing has to be rewritten.
 - Limit: every segment adds about 400 characters to the ffmpeg command line (Windows allows about 32000), so an edit with 60+ separate segments would fail. If that ever happens: write the filter to a file (`-/filter_complex file` on ffmpeg 7+).
 
 ## Main APIs (as built)
@@ -73,39 +88,3 @@ New tool dialogs/panels (crop, audio, text, export settings) -> `pedio/ui/` (a `
 - `BottomToolbar` signal `tool_clicked(category, tool)`; `MainWindow.on_tool()` handles Import, Trim Start, Trim End, Split, Delete, Export Video.
 - Export (core/export.py): `ExportWorker(clips, out_path, settings=None)` with `clips = [(path, start, length)]`; signals `progress(float 0..1)`, `done(path)`, `failed(msg)`, `cancelled()`; `stop()` kills ffmpeg. `ExportDialog(clips, out_path, settings, parent)`: `exec()`, then `.succeeded`. `MainWindow.export_video()` asks for the file name (refuses a source file) and opens the dialog. Output: MP4, libx264 CRF 20 veryfast, AAC 192k, yuv420p, faststart.
 - workers: thumbnails about 150 per video (`thumb_step`), waveform 200 peaks per second (min/max of 8 kHz mono audio), `ProbeWorker` (ffprobe: length + has-video check) before a file is added.
-
-## Using the timeline (Step 4)
-- Mouse: click a clip = select + move playhead. Drag its yellow edge handles = trim. Drag the clip body = reorder. Drag on the ruler = move playhead. Ctrl+wheel = zoom. "Snap" button toggles snapping (clip edges + playhead, 8 px).
-- Keys: Space play/pause, S split at playhead, Del delete (selected clip, else the clip under the playhead), [ and ] cut the start / end of the clip under the playhead, Ctrl+O import (several files allowed).
-
-## Steps (one chat per step; every new feature = a new chat)
-1. Setup + layout - DONE
-2. Import + player (button, drag-drop, play/pause, seek, volume, mute) - DONE
-3. Timelines (thumbnails, waveform + mute button, playhead, zoom) - DONE
-4. Trim / split / delete / join / reorder / snapping + shortcuts - DONE
-5. Basic export (FFmpeg, progress, cancel, background thread) - DONE
-6. Aspect ratio presets (9:16, 16:9, 4:3, 1:1 ...), crop with a draggable box on the preview, rotate, flip; export matches - NEXT. Preview: mpv video filters / `video-crop`; export: add to the per-segment filter chain in `build_command()`; output size goes in `ExportSettings.size`.
-7. Audio: add MP3/WAV/AAC tracks, extract audio from a video, volume per clip, mute, audio fade in/out (0.1-2 s); export matches
-8. Video fade in/out at split points and where two clips meet (0.1-2 s slider); export matches
-9. Text overlay: size, color, shadow, outline size/color, start/end time on the timeline, drag to position on the preview; export matches
-10. Clip speed + export settings (resolution, quality, format)
-11. Undo/redo, save/open project file, autosave, full keyboard shortcuts
-12. Dark theme, hardware decoding toggle, app icon, PyInstaller .exe (mpv dll, vulkan-1.dll, ffmpeg) = the simple editor is finished
-
-Advanced features (only after Step 12 works):
-13. Image / graphic overlay layers (PNG / JPG: position, scale, opacity, start/end, order); shares the layer model of the text overlay
-14. Keyframes 1: keyframe engine in `pedio/core/` (value at time t, linear / hold / ease), keyframe lane + diamonds on the timeline, animate layer position / scale / opacity; preview + export match
-15. Keyframes 2: animate the video clip (position / scale / rotation / opacity), text and audio volume; copy / paste keyframes
-16. Smart masking 1: AI model setup (downloaded on first use, must run on a CPU-only laptop), brush on the preview (paint foreground / background, eraser), mask of one frame
-17. Smart masking 2: track the mask across the whole clip (background thread, progress, cancel, mask cache on disk), correction strokes on any frame
-18. Smart masking 3: put text / graphics behind the subject (between foreground and background), edge feather; preview + export match
-19. Rebuild the .exe with the AI parts (model downloaded on first use, not bundled)
-
-## Status / notes
-- Step 4 tested on Linux (libmpv + ffmpeg under Xvfb): 141 checks (model, import, playback across clips incl. a clip without audio and odd file names, split / delete / trim / reorder / snap, shortcuts, editing while playing). Not yet tested on Windows.
-- Folder restructure (Nov 2026): code moved into `pedio/` (core, ui); imports are absolute.
-- Test scripts live outside the repo (they need a Linux display); nothing to run from here.
-- No undo yet (Step 11): Delete cannot be undone.
-- Step 5 tested on Linux (ffmpeg 6.1, PySide6 offscreen): 36 export checks + 9 window checks (mixed sizes / fps, clip without audio, odd file names, trimmed + split + reordered, same source twice, cancel, bad folder, missing file, dialog Cancel / Esc). The real MainWindow + mpv preview were not run for export; not yet tested on Windows.
-- The preview keeps playing while the export dialog is open (harmless; pause it in the Step 11 polish if it slows the export).
-- Keep one source of truth: the player and the export both read `Project.play_list()`.
