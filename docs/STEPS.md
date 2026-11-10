@@ -18,7 +18,7 @@ Tested on Windows: preview, export and timeline thumbnails match. Fixed on the w
 - [x] 6b Crop box + crop in export; CLAUDE.md updated; merged into main
 
 ## Step 7 - Audio
-- [ ] 7a Audio track model + export mix, no UI. Files: core/audio.py (AudioClip: path, start, in/out, volume, mute), core/clips.py (add / remove), core/export.py (amix)
+- [x] 7a Audio track model + export mix, no UI. Files: core/audio.py (AudioClip: path, start, in/out, volume, mute), core/clips.py (add / remove), core/export.py (amix). Also wired: ui/export_dialog.py + ui/main_window.py pass `Project.audio_clips` to the export. Not testable until 7b (no way to add audio yet); without audio clips the export command is unchanged.
 - [ ] 7b Audio lane on the timeline, import MP3 / WAV / AAC, extract audio from a video. Files: ui/timeline.py, ui/main_window.py, ui/toolbar.py
 - [ ] 7c Preview plays the mix, volume per clip, mute. Files: ui/player.py, ui/panels/audio_panel.py
 - [ ] 7d Audio fade in/out at the ends (0.1-2 s slider): data + preview + export

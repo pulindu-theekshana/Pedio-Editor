@@ -1,23 +1,24 @@
 """Export the timeline to an MP4 file with ffmpeg. No widgets here: a pure command builder + a QThread worker.
 
 The clip list is `Project.play_list()` = [Segment(path, start, length, transform, ...)], the same list the
-player plays, so what you see in the preview is what you get in the file.
+player plays, so what you see in the preview is what you get in the file. The audio lane
+(`Project.audio_clips`) is mixed over the sound of the video clips.
 """
 import json
 import os
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 
 from PySide6.QtCore import QThread, Signal
 
+from pedio.core.audio import AUDIO_RATE, audible, clip_filter
 from pedio.core.clips import Segment
 from pedio.core.transform import output_size, stream_rotation, video_filters
 from pedio.core.workers import CREATE_NO_WINDOW
 from pedio.paths import find_tool
 
-AUDIO_RATE = 48000
 DEFAULT_FPS = Fraction(30)
 
 
@@ -78,13 +79,17 @@ def probe_source(path):
 
 
 # ---------------------------------------------------------------------- command
-def build_command(ffmpeg, clips, sources, out_path, settings):
-    """The ffmpeg command line. clips = [Segment] (3-tuples work too), sources = {path: SourceInfo}.
+def build_command(ffmpeg, clips, sources, out_path, settings, audio=()):
+    """The ffmpeg command line. clips = [Segment] (3-tuples work too), sources = {path: SourceInfo},
+    audio = [AudioClip] from the audio lane (optional).
 
     Every clip is cut with input seeking (-ss / -t), mirrored / rotated / cropped (video_filters, the same
     filters the preview uses), brought to one size / frame rate / audio format, then joined with the
     concat filter. A clip without sound gets silence of the same length.
     The output size is the size of the first clip after its transform; the other clips are fitted into it.
+    Audio clips (not muted, inside the video's length) are added as extra inputs, each one volume-set and
+    delayed to its start (audio.clip_filter), then mixed over the video's sound with amix. The video decides
+    the length. With no audio clips the command is the same as without this feature.
     """
     clips = [Segment(*c) for c in clips]
     first = sources[clips[0].path]
@@ -109,7 +114,18 @@ def build_command(ffmpeg, clips, sources, out_path, settings):
             audio = f"anullsrc=r={AUDIO_RATE}:cl=stereo"
         parts.append(f"{audio},atrim=duration={length:.6f},asetpts=PTS-STARTPTS[a{i}]")
         joined += f"[v{i}][a{i}]"
-    parts.append(f"{joined}concat=n={len(clips)}:v=1:a=1[v][a]")
+
+    extra = audible(audio, sum(seg.length for seg in clips))
+    if extra:
+        parts.append(f"{joined}concat=n={len(clips)}:v=1:a=1[v][bed]")
+        labels = "[bed]"                      # first, so `duration=first` keeps the video's length
+        for j, clip in enumerate(extra):
+            cmd += ["-ss", f"{clip.src_in:.6f}", "-t", f"{clip.length:.6f}", "-i", clip.path]
+            parts.append(clip_filter(clip, len(clips) + j, f"m{j}"))     # audio inputs come after the video ones
+            labels += f"[m{j}]"
+        parts.append(f"{labels}amix=inputs={len(extra) + 1}:duration=first:normalize=0[a]")
+    else:
+        parts.append(f"{joined}concat=n={len(clips)}:v=1:a=1[v][a]")
 
     cmd += [
         "-filter_complex", ";".join(parts), "-map", "[v]", "-map", "[a]",
@@ -142,9 +158,10 @@ class ExportWorker(QThread):
     failed = Signal(str)         # message for the user
     cancelled = Signal()
 
-    def __init__(self, clips, out_path, settings=None, parent=None):
+    def __init__(self, clips, out_path, settings=None, parent=None, audio=()):
         super().__init__(parent)
         self.clips = [Segment(*c) for c in clips]     # copy: later edits do not change a running export
+        self.audio = [replace(a) for a in audio]      # AudioClip copies, same reason
         self.out_path = out_path
         self.settings = settings or ExportSettings()
         self._stop = False
@@ -183,8 +200,11 @@ class ExportWorker(QThread):
                     return self._cancel(part)
                 sources[seg.path] = probe_source(seg.path)
         total = sum(seg.length for seg in self.clips)
+        for clip in audible(self.audio, total):
+            if not os.path.isfile(clip.path):
+                raise ExportError(f"Could not read {os.path.basename(clip.path)}. Was the file moved or deleted?")
 
-        cmd = build_command(ffmpeg, self.clips, sources, part, self.settings)
+        cmd = build_command(ffmpeg, self.clips, sources, part, self.settings, self.audio)
         with tempfile.TemporaryFile() as errors:      # a file, so ffmpeg can never block on a full pipe
             self._proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=errors, stdin=subprocess.DEVNULL,

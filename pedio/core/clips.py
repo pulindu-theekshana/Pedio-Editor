@@ -5,6 +5,7 @@ from typing import NamedTuple
 
 from PySide6.QtCore import QObject, Signal
 
+from pedio.core.audio import MAX_VOLUME, AudioClip
 from pedio.core.transform import Transform, centered_crop
 
 MIN_CLIP = 0.1  # shortest clip allowed, in seconds
@@ -44,15 +45,16 @@ class Segment(NamedTuple):
 
 
 class Project(QObject):
-    """List of clips (timeline order) + the selected clip. Every edit goes through a method here."""
+    """List of clips (timeline order) + the selected clip + the audio lane. Every edit goes through a method here."""
 
-    changed = Signal()            # clips were added / split / trimmed / deleted / moved
+    changed = Signal()            # clips / audio were added / split / trimmed / deleted / moved / changed
     selection_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.clips = []
         self.selected_id = 0      # 0 = nothing selected
+        self.audio_clips = []     # AudioClip list (core/audio.py), placed freely by `start`; may overlap (they are mixed)
 
     # ------------------------------------------------------------------ reading
     def total(self):
@@ -197,6 +199,43 @@ class Project(QObject):
         if new_index == i:
             return False
         self.clips.insert(new_index, self.clips.pop(i))
+        self.changed.emit()
+        return True
+
+    # ---- audio lane (see core/audio.py). The video decides the length: sound past its end is not exported.
+    def audio_index_of(self, audio_id):
+        for i, a in enumerate(self.audio_clips):
+            if a.id == audio_id:
+                return i
+        return -1
+
+    def add_audio(self, path, duration, start=0.0):
+        """Put a whole sound file on the audio lane at timeline time `start`. Returns the new AudioClip."""
+        clip = AudioClip(path, duration, 0.0, duration, start=max(start, 0.0))
+        self.audio_clips.append(clip)
+        self.changed.emit()
+        return clip
+
+    def remove_audio(self, audio_id):
+        i = self.audio_index_of(audio_id)
+        if i < 0:
+            return False
+        del self.audio_clips[i]
+        self.changed.emit()
+        return True
+
+    def set_audio(self, audio_id, start=None, volume=None, mute=None):
+        """Change where an audio clip starts, its volume (0 .. MAX_VOLUME) or mute. None = leave as it is."""
+        i = self.audio_index_of(audio_id)
+        if i < 0:
+            return False
+        a = self.audio_clips[i]
+        new_start = a.start if start is None else max(start, 0.0)
+        new_volume = a.volume if volume is None else min(max(volume, 0.0), MAX_VOLUME)
+        new_mute = a.mute if mute is None else bool(mute)
+        if (abs(new_start - a.start) < 1e-6 and abs(new_volume - a.volume) < 1e-6 and new_mute == a.mute):
+            return False
+        a.start, a.volume, a.mute = new_start, new_volume, new_mute
         self.changed.emit()
         return True
 

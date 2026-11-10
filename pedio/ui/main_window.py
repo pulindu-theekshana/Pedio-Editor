@@ -260,10 +260,11 @@ class MainWindow(QMainWindow):
         if not path.lower().endswith(".mp4"):
             path += ".mp4"
         same = os.path.normcase(os.path.abspath(path))
-        if any(os.path.normcase(os.path.abspath(c[0])) == same for c in clips):
+        used = [c[0] for c in clips] + [a.path for a in self.project.audio_clips]
+        if any(os.path.normcase(os.path.abspath(p)) == same for p in used):
             QMessageBox.warning(self, "Export", "This file is used by the edit. Choose another file name.")
             return
-        dialog = ExportDialog(clips, path, parent=self)
+        dialog = ExportDialog(clips, path, parent=self, audio=self.project.audio_clips)
         dialog.exec()
         if dialog.succeeded:
             self.statusBar().showMessage(f"Exported {os.path.basename(path)}")
