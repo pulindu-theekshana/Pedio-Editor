@@ -24,8 +24,8 @@ Tested on Windows: preview, export and timeline thumbnails match. Fixed on the w
 - [x] 7d Audio fade in/out at the ends (0.1-2 s slider): data + preview + export
 
 ## Step 8 - Video fades
-- [ ] 8a Fade data at splits / joins + export (`fade` filter in build_command()). Files: core/clips.py, core/export.py
-- [ ] 8b Preview fade + 0.1-2 s slider. Files: ui/player.py, ui/panels/
+- [x] 8a Fade data at splits / joins + export (`fade` filter in build_command()). Files: core/clips.py, core/export.py
+- [x] 8b Preview fade + 0.1-2 s slider. Files: ui/player.py, ui/panels/
 
 ## Step 9 - Text overlay
 - [ ] 9a Layer model, no UI: core/layers.py (TextLayer: text, size, color, shadow, outline size/color, start/end, x/y; image layers reuse it in Step 13) + export (drawtext)

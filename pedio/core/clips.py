@@ -23,6 +23,8 @@ class Clip:
     size: tuple = (0, 0)  # picture size as a player shows it (phone rotation applied); (0, 0) = unknown
     meta_rotation: int = 0           # clockwise turn the file asks for in its metadata (phone videos)
     transform: Transform = Transform()   # mirror / rotate / crop chosen by the user
+    fade_in: float = 0.0             # seconds of fade from black at the clip start (0 .. 2)
+    fade_out: float = 0.0            # seconds of fade to black at the clip end (0 .. 2)
 
     @property
     def length(self):
@@ -42,6 +44,8 @@ class Segment(NamedTuple):
     length: float
     transform: Transform = Transform()
     meta_rotation: int = 0
+    fade_in: float = 0.0
+    fade_out: float = 0.0
 
 
 class Project(QObject):
@@ -94,15 +98,17 @@ class Project(QObject):
 
     def play_list(self):
         """[Segment] for the player and the export. Neighbours that continue each other (same file,
-        same transform) are merged, so a plain split does not change this list."""
+        same transform, no fade between them) are merged, so a plain split does not change this list."""
         out = []
         for c in self.clips:
             last = out[-1] if out else None
             if (last and last.path == c.path and abs(last.start + last.length - c.src_in) < 1e-6
-                    and last.transform == c.transform):
-                out[-1] = last._replace(length=last.length + c.length)
+                    and last.transform == c.transform and abs(last.fade_out) < 1e-6
+                    and abs(c.fade_in) < 1e-6):
+                out[-1] = last._replace(length=last.length + c.length, fade_out=c.fade_out)
             else:
-                out.append(Segment(c.path, c.src_in, c.length, c.transform, c.meta_rotation))
+                out.append(Segment(c.path, c.src_in, c.length, c.transform, c.meta_rotation,
+                                   c.fade_in, c.fade_out))
         return out
 
     # ------------------------------------------------------------------ audio reading
@@ -323,6 +329,21 @@ class Project(QObject):
         """rect = (x, y, w, h) as fractions of the picture, or None for no crop."""
         i = self.index_of(clip_id)
         return i >= 0 and self.set_transform(clip_id, self.clips[i].transform.with_crop(rect))
+
+    def set_fades(self, clip_id, fade_in, fade_out):
+        """Fade from / to black at the clip ends, 0 .. min(2 s, half the clip)."""
+        i = self.index_of(clip_id)
+        if i < 0:
+            return False
+        c = self.clips[i]
+        top = min(2.0, c.length / 2)
+        fade_in = min(max(float(fade_in), 0.0), top)
+        fade_out = min(max(float(fade_out), 0.0), top)
+        if abs(fade_in - c.fade_in) < 1e-6 and abs(fade_out - c.fade_out) < 1e-6:
+            return False
+        c.fade_in, c.fade_out = fade_in, fade_out
+        self.changed.emit()
+        return True
 
     def set_aspect_all(self, ratio):
         """Crop EVERY clip to the biggest centered box with this ratio (w, h); None = remove all crops.

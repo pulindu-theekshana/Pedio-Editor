@@ -60,11 +60,13 @@ def merge_sources(segments):
 
 
 def look_schedule(segments):
-    """[(end_time, (transform, meta_rotation))] in timeline seconds: which look is on screen until end_time."""
+    """[(end_time, (transform, meta_rotation, fade_in, fade_out, start, end))] in timeline seconds:
+    which look is on screen until end_time."""
     out, t = [], 0.0
     for s in segments:
+        start = t
         t += s.length
-        out.append((t, (s.transform, s.meta_rotation)))
+        out.append((t, (s.transform, s.meta_rotation, s.fade_in, s.fade_out, start, t)))
     return out
 
 
@@ -342,10 +344,16 @@ class PlayerWidget(QWidget):
         if look == self._applied_look:
             return
         self._applied_look = look
-        transform, meta_rotation = look
-        # no transform: mpv shows the picture as before (it turns phone videos by itself, no filter needed).
-        # with a transform: the filters do everything, including the phone rotation, so mpv must not rotate too.
-        filters = [] if transform.is_default else video_filters(transform, meta_rotation)
+        transform, meta_rotation, fade_in, fade_out, start, end = look
+        need = (not transform.is_default) or fade_in > 0 or fade_out > 0
+        # no transform and no fade: mpv shows the picture as before (it turns phone videos by itself).
+        # with a transform or a fade: the filters do everything, including the phone rotation.
+        filters = video_filters(transform, meta_rotation) if need else []
+        if fade_in > 0:
+            filters.append(f"fade=t=in:st={start:.3f}:d={min(fade_in, end - start):.3f}")
+        if fade_out > 0:
+            at = max(end - fade_out, start)
+            filters.append(f"fade=t=out:st={at:.3f}:d={min(fade_out, end - start):.3f}")
         try:
             self.player.video_rotate = "no" if filters else "0"
             if filters:

@@ -655,6 +655,8 @@ class TimelineView(QWidget):
                     continue
                 self._paint_video_clip(p, video_y, s, x0, x1, w)
                 self._paint_audio_clip(p, audio_y, s, x0, x1, w)
+                if s.clip.fade_in or s.clip.fade_out:
+                    self._paint_fades(p, s, x0, x1, video_y)
                 self._paint_frame(p, s, x0, x1, w, video_y, audio_y)
         for clip in self.project.audio_clips:
             start = self._audio_start(clip)
@@ -802,6 +804,21 @@ class TimelineView(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(QPen(SELECT, 2))
             p.drawRect(QRect(int(round(x0)) + 1, y + 1, int(round(x1)) - int(round(x0)) - 2, TRACK_H - 2))
+
+    def _paint_fades(self, p, s, x0, x1, vy):
+        """Show the fade to / from black as dark wedges at the clip ends."""
+        length = max(s.t1 - s.t0, 1e-6)
+        fi = min(s.clip.fade_in, length) * self.pps
+        fo = min(s.clip.fade_out, length) * self.pps
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 120))
+        if fi > 0.5:
+            p.drawPolygon(QPolygon([QPoint(int(x0), vy), QPoint(int(x0 + fi), vy),
+                                    QPoint(int(x0), vy + TRACK_H)]))
+        if fo > 0.5:
+            p.drawPolygon(QPolygon([QPoint(int(x1 - fo), vy + TRACK_H), QPoint(int(x1), vy + TRACK_H),
+                                    QPoint(int(x1), vy)]))
+        p.setBrush(Qt.BrushStyle.NoBrush)
 
     def _paint_frame(self, p, s, x0, x1, w, vy, ay):
         """Clip border, name + length, and (for the selected clip) the outline and trim handles."""

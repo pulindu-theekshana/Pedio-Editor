@@ -14,6 +14,7 @@ from pedio.core.workers import AudioProbeWorker, ProbeWorker
 from pedio.ui.crop_editor import CropEditor
 from pedio.ui.export_dialog import ExportDialog
 from pedio.ui.panels.audio_panel import AudioPanel
+from pedio.ui.panels.fade_panel import FadePanel
 from pedio.ui.player import AUDIO_EXTS, VIDEO_EXTS, PlayerWidget
 from pedio.ui.timeline import TimelinePanel
 from pedio.ui.toolbar import BottomToolbar
@@ -40,6 +41,7 @@ class MainWindow(QMainWindow):
         self._mix_timer.setInterval(500)
         self._mix_timer.timeout.connect(self._start_audio_mix)
         self.audio_panel = None        # created on first use
+        self.fade_panel = None         # created on first use
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -184,6 +186,15 @@ class MainWindow(QMainWindow):
         self.audio_panel.show()
         self.audio_panel.raise_()
         self.audio_panel.activateWindow()
+
+    def open_fade_panel(self):
+        """Effects > Fade In / Fade Out: fade the selected video clip to / from black."""
+        if self.fade_panel is None:
+            self.fade_panel = FadePanel(self.project, self)
+        self.fade_panel.refresh()
+        self.fade_panel.show()
+        self.fade_panel.raise_()
+        self.fade_panel.activateWindow()
 
     def toggle_audio_mute(self):
         clip = self.project.audio_by_id(self.project.selected_audio_id)
@@ -480,6 +491,8 @@ class MainWindow(QMainWindow):
             "Volume": self.open_audio_panel,
             "Mute": self.toggle_audio_mute,
             "Fade In/Out": self.open_audio_panel,
+            "Fade In": self.open_fade_panel,
+            "Fade Out": self.open_fade_panel,
             "Export Video": self.export_video,
         }
         action = actions.get(tool)

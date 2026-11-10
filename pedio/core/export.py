@@ -116,6 +116,26 @@ def _extra_audio_filter(clip):
     return chain
 
 
+def _segment_fades(seg):
+    """Video fade from / to black at the ends of one segment (its PTS starts at 0)."""
+    out = ""
+    if seg.fade_in > 0:
+        out += f",fade=t=in:st=0:d={min(seg.fade_in, seg.length):.6f}"
+    if seg.fade_out > 0:
+        out += f",fade=t=out:st={max(seg.length - seg.fade_out, 0.0):.6f}:d={min(seg.fade_out, seg.length):.6f}"
+    return out
+
+
+def _segment_audio_fades(seg):
+    """The same fades for the clip's own sound (so the sound does not jump at the cut)."""
+    out = ""
+    if seg.fade_in > 0:
+        out += f",afade=t=in:st=0:d={min(seg.fade_in, seg.length):.6f}"
+    if seg.fade_out > 0:
+        out += f",afade=t=out:st={max(seg.length - seg.fade_out, 0.0):.6f}:d={min(seg.fade_out, seg.length):.6f}"
+    return out
+
+
 # ---------------------------------------------------------------------- command
 def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=()):
     """The ffmpeg command line. clips = [Segment] (3-tuples work too), sources = {path: SourceInfo}.
@@ -140,15 +160,16 @@ def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=()):
         cmd += ["-ss", f"{seg.start:.6f}", "-t", f"{length:.6f}", "-i", path]
         # ffmpeg turns phone videos upright by itself, so meta_rotation stays 0 here (the player has to do it)
         look = "".join(f + "," for f in video_filters(seg.transform))
+        fade = _segment_fades(seg)
         parts.append(
             f"[{i}:v:0]{look}scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
-            f"fps={fps.numerator}/{fps.denominator},format=yuv420p,setpts=PTS-STARTPTS[v{i}]")
+            f"fps={fps.numerator}/{fps.denominator},format=yuv420p,setpts=PTS-STARTPTS{fade}[v{i}]")
         if sources[path].has_audio:
             audio = f"[{i}:a:0]aresample={AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,apad"
         else:
             audio = f"anullsrc=r={AUDIO_RATE}:cl=stereo"
-        parts.append(f"{audio},atrim=duration={length:.6f},asetpts=PTS-STARTPTS[a{i}]")
+        parts.append(f"{audio},atrim=duration={length:.6f},asetpts=PTS-STARTPTS{_segment_audio_fades(seg)}[a{i}]")
         joined += f"[v{i}][a{i}]"
     parts.append(f"{joined}concat=n={len(clips)}:v=1:a=1[v][basea]")
 
@@ -186,7 +207,8 @@ def build_audio_mix_command(ffmpeg, clips, sources, out_path, audio_clips=()):
             audio = f"[{i}:a:0]aresample={AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,apad"
         else:
             audio = f"anullsrc=r={AUDIO_RATE}:cl=stereo"
-        parts.append(f"{audio},atrim=duration={seg.length:.6f},asetpts=PTS-STARTPTS[a{i}]")
+        parts.append(f"{audio},atrim=duration={seg.length:.6f},asetpts=PTS-STARTPTS"
+                     f"{_segment_audio_fades(seg)}[a{i}]")
         joined += f"[a{i}]"
     parts.append(f"{joined}concat=n={len(clips)}:v=0:a=1[basea]")
     if audio_clips:

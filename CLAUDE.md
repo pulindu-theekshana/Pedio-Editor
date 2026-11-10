@@ -30,7 +30,7 @@ First time only: `setup.bat` (venv, pip, libmpv, vulkan-1.dll, ffmpeg into bin\,
 
 ## Build order (details + mini-steps: docs/STEPS.md)
 - Done (all tested on Windows): 1 setup, 2 import + player, 3 timelines, 4 trim / split / delete / reorder / snap, 5 export, 6 picture (rotate, flip, aspect ratio, crop: preview, export and timeline thumbnails match).
-  - CURRENT: 7 audio is done. Next mini-step: 8a (video fades).
+  - CURRENT: 8 video fades is done. Next mini-step: 9a (text layer model + export).
 - Basic, then: 8 video fades | 9 text overlay | 10 speed + export settings | 11 undo, save / open, autosave, shortcuts | 12 dark theme, hardware decoding, icon, .exe
 - Advanced (after 12): 13 image overlays | 14-15 keyframes | 16-18 smart masking | 19 .exe with the AI parts
 
@@ -64,6 +64,7 @@ pedio-editor/
       toolbar.py       BottomToolbar + CATEGORIES (Video, Audio, Effects, Text, Export)
       panels/
         audio_panel.py AudioPanel (volume, mute, fade in/out for the selected audio clip)
+        fade_panel.py  FadePanel (fade in/out for the selected video clip)
 ```
 Where new code goes: clip/project data, export command builder, undo history, project save/load -> `pedio/core/`.
 New tool dialogs/panels (crop, audio, text, export settings) -> `pedio/ui/` (a `pedio/ui/panels/` subfolder when there are several).
@@ -83,13 +84,14 @@ New tool dialogs/panels (crop, audio, text, export settings) -> `pedio/ui/` (a `
 - No gaps on the timeline: clips are always joined end to end (delete / trim close the gap).
 - The player reloads mpv only when `Project.play_list()` changes; neighbours that continue each other are merged, so a plain split does not reload.
 - Preview sound = one temporary m4a built by ffmpeg (`AudioMixWorker`) from the video sound + audio clips; `PlayerWidget.set_audio_mix(path)` sets mpv's `audio-file` and reloads at the same position. Debounced 500 ms in `MainWindow`. When there are no clips the mix is cleared.
+- Video fades are per clip (`Clip.fade_in/fade_out`). Export uses `fade`/`afade` at the segment's own PTS 0. The preview adds `fade` filters with global timeline times to the player's `vf=lavfi` chain (the chain is switched per clip, like the transform).
 - Export uses `Project.play_list()` (same list as the player). Each segment is cut with input seeking (`-ss/-t -i`), scaled/padded to the first clip's size + fps, joined with `concat`; a clip without audio gets `anullsrc` silence. The file is written as `<name>.mp4.part` and renamed when complete.
 - New per-clip effects (crop, rotate, fades, text, speed) go into the per-segment filter chain in `build_command()`; new options go into `ExportSettings`.
 - Keep every effect as plain data on the clip / layer, applied in ONE place for the preview and ONE place for the export (one source of truth). Then keyframes (Steps 14-15) only add "value at time t" and nothing has to be rewritten.
 - Limit: every segment adds about 400 characters to the ffmpeg command line (Windows allows about 32000), so an edit with 60+ separate segments would fail. If that ever happens: write the filter to a file (`-/filter_complex file` on ffmpeg 7+).
 
 ## Main APIs (as built)
-- `Project` (core/clips.py): `clips` (list of `Clip(path, src_duration, src_in, src_out, id, size, meta_rotation, transform)`), `audio_clips` (list of `AudioClip(path, start, src_in, src_out, volume, mute, id)`), `selected_id`, signals `changed`, `selection_changed`. Reading: `total()`, `starts()`, `boundaries()`, `index_of(id)`, `clip_at(t)`, `play_list()` (= list of `Segment(path, start, length, transform, meta_rotation)`). Edits (return True if something changed): `add_clip(path, duration)`, `add_audio_clip(path, start, src_in, src_out, volume=1.0, mute=False)`, `remove_audio_clip(id)`, `split(t)`, `delete(id)`, `trim_start(id, new_in)`, `trim_end(id, new_out)`, `trim_start_at(t)`, `trim_end_at(t)`, `move(id, new_index)`, `select(id)`, `rotate(id)`, `flip(id, horizontal)`, `set_crop(id, rect)`, `set_aspect_all(ratio)`, `set_transform(id, Transform)`. `MIN_CLIP` = 0.1 s.
+- `Project` (core/clips.py): `clips` (list of `Clip(path, src_duration, src_in, src_out, id, size, meta_rotation, transform, fade_in, fade_out)`), `audio_clips` (list of `AudioClip(path, start, src_in, src_out, volume, mute, id)`), `selected_id`, `selected_audio_id`, signals `changed`, `selection_changed`. Reading: `total()`, `extent()`, `starts()`, `boundaries()`, `index_of(id)`, `clip_at(t)`, `play_list()` (= list of `Segment(path, start, length, transform, meta_rotation, fade_in, fade_out)`). Edits (return True if something changed): `add_clip(path, duration)`, `add_audio_clip(path, start, src_in, src_out, volume=1.0, mute=False)`, `remove_audio_clip(id)`, `split(t)`, `delete(id)`, `trim_start(id, new_in)`, `trim_end(id, new_out)`, `trim_start_at(t)`, `trim_end_at(t)`, `move(id, new_index)`, `select(id)`, `rotate(id)`, `flip(id, horizontal)`, `set_crop(id, rect)`, `set_fades(id, fade_in, fade_out)`, `set_aspect_all(ratio)`, `set_transform(id, Transform)`. `MIN_CLIP` = 0.1 s.
 - `AudioClip` (core/audio.py): `path`, `start` (timeline seconds), `src_in`, `src_out`, `volume`, `mute`, `fade_in`, `fade_out` (seconds); `length`, `end`. `Project`: `audio_clips`, `selected_audio_id`, `audio_index_of`, `audio_by_id`, `extent()`, `select_audio(id)`, `clear_selection()`, `move_audio_clip`, `set_audio_volume`, `set_audio_mute`, `set_audio_fades`.
 - `PlayerWidget` signals: `file_loaded(str)`, `load_failed(str)`, `position_changed(float)`, `duration_changed(float)`, `playing_changed(bool)`, `muted_changed(bool)`. Methods: `set_edit_list([Segment], position)`, `set_audio_mix(path)`, `audio_mix_path()`, `toggle_play()`, `pause()`, `refresh()`, `seek_to(sec, exact=True)`, `set_muted(bool)`, `toggle_mute()`, `is_muted()`, `position()`, `duration()`, `shutdown()`. Positions are timeline seconds (mpv edl:// time).
 - `TimelinePanel(player, project)`: `position()`, `set_playhead(t)`, `shutdown()`. Inner `TimelineView(project)`: `set_zoom(pps, anchor_x)`, `zoom_fit`, `set_position`, `set_playhead`, `set_snap`, signal `seek_requested(float, bool)`. Zoom is pixels per second (fit .. 300). Thumbnails / waveform are kept per source file (`Media`), shared by all clips of that file.
