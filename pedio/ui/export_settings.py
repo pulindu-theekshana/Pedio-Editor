@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFormLayout
 from pedio.core.export import CONTAINERS, ExportSettings
 
 QUALITY = [("Best (CRF 16)", 16, "slow"), ("High (CRF 19)", 19, "medium"),
-           ("Balanced (CRF 22)", 22, "veryfast"), ("Small file (CRF 28)", 28, "veryfast")]
+           ("Balanced (CRF 20)", 20, "veryfast"), ("Small file (CRF 28)", 28, "veryfast")]
 RESOLUTIONS = [("Original", None), ("1920 x 1080", (1920, 1080)), ("1280 x 720", (1280, 720)),
                ("854 x 480", (854, 480)), ("1080 x 1920 (vertical)", (1080, 1920)),
                ("1080 x 1080 (square)", (1080, 1080))]
@@ -63,8 +63,11 @@ class ExportSettingsDialog(QDialog):
 
     @staticmethod
     def _select(combo, value):
-        index = combo.findData(value)
-        combo.setCurrentIndex(index if index >= 0 else 0)
+        for index in range(combo.count()):
+            if combo.itemData(index) == value:
+                combo.setCurrentIndex(index)
+                return
+        combo.setCurrentIndex(0)
 
     def values(self):
         crf, preset = self.quality.currentData()

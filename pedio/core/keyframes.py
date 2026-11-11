@@ -103,9 +103,10 @@ def anim_from_dict(data):
     return out
 
 
-def expression(keyframes, start, end, default, shift=0.0):
+def expression(keyframes, start, end, default, shift=0.0, var="t"):
     """A piecewise-linear ffmpeg expression of this track between start and end (timeline seconds).
-    `shift` is added to the filter's local time (e.g. an audio clip delayed to its timeline start)."""
+    `shift` is added to the filter's local time (e.g. an audio clip delayed to its timeline start).
+    `var` is the filter's time variable (`t` for most filters, `T` for geq)."""
     points = sorted((k for k in (keyframes or []) if start - 1e-6 <= k.t <= end + 1e-6),
                     key=lambda k: k.t)
     if not points:
@@ -119,8 +120,8 @@ def expression(keyframes, start, end, default, shift=0.0):
         if a.easing == "hold":
             part = f"{a.value:.6f}"
         else:
-            part = f"({a.value:.6f}+({b.value - a.value:.6f})*(t-{ta:.6f})/{span:.6f})"
-        out = f"if(lt(t,{tb:.6f}),{part},{out})"
+            part = f"({a.value:.6f}+({b.value - a.value:.6f})*({var}-{ta:.6f})/{span:.6f})"
+        out = f"if(lt({var},{tb:.6f}),{part},{out})"
     if points[0].t + shift > 0:
-        out = f"if(lt(t,{points[0].t + shift:.6f}),{points[0].value:.6f},{out})"
+        out = f"if(lt({var},{points[0].t + shift:.6f}),{points[0].value:.6f},{out})"
     return out

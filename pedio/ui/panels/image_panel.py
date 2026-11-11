@@ -47,6 +47,8 @@ class ImagePanel(QDialog):
         self.scale_label = QLabel()
         self.opacity_label = QLabel()
         self.delete_btn = QPushButton("Delete image")
+        self.up_btn = QPushButton("Move up (draw later)")
+        self.down_btn = QPushButton("Move down (draw earlier)")
 
         form = QFormLayout()
         form.addRow("Start", self.start)
@@ -58,14 +60,20 @@ class ImagePanel(QDialog):
         form.addRow("Opacity", _slider_row(self.opacity))
         form.addRow("", self.opacity_label)
 
+        order = QHBoxLayout()
+        order.addWidget(self.up_btn)
+        order.addWidget(self.down_btn)
         root = QVBoxLayout(self)
         root.addWidget(self.title)
         root.addLayout(form)
+        root.addLayout(order)
         root.addWidget(self.delete_btn)
 
         for w in (self.start, self.end, self.x, self.y, self.scale, self.opacity):
             w.valueChanged.connect(self._queue)
         self.delete_btn.clicked.connect(self._delete)
+        self.up_btn.clicked.connect(lambda: self._move(1))
+        self.down_btn.clicked.connect(lambda: self._move(-1))
         self.project.selection_changed.connect(self.refresh)
         self.project.changed.connect(self.refresh)
         self.refresh()
@@ -76,7 +84,8 @@ class ImagePanel(QDialog):
     def refresh(self):
         layer = self._layer()
         self._updating = True
-        for w in (self.start, self.end, self.x, self.y, self.scale, self.opacity, self.delete_btn):
+        for w in (self.start, self.end, self.x, self.y, self.scale, self.opacity, self.delete_btn,
+                  self.up_btn, self.down_btn):
             w.setEnabled(layer is not None)
         if layer is None:
             self.title.setText("No image selected (Image > Add Image)")
@@ -115,3 +124,9 @@ class ImagePanel(QDialog):
         layer = self._layer()
         if layer is not None:
             self.project.remove_image_layer(layer.id)
+
+    def _move(self, step):
+        layer = self._layer()
+        if layer is not None:
+            index = self.project.image_index_of(layer.id)
+            self.project.move_image_layer(layer.id, index + step)

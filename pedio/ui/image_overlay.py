@@ -3,8 +3,6 @@
 The export overlays the same pictures in ffmpeg (scale = frame width * layer.scale, top-left =
 (W - w) * x, (H - h) * y), so what this widget shows is what the file gets.
 """
-import os
-
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
@@ -54,7 +52,8 @@ class ImageOverlay(QWidget):
             self.hide()
             return
         self.show()
-        self.raise_()
+        if self.project.selected_image_id:
+            self.raise_()
         self.update()
 
     def _layer(self):

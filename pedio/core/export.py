@@ -239,13 +239,30 @@ def build_command(ffmpeg, clips, sources, out_path, settings, audio_clips=(), te
     for n, layer in enumerate(active_images):
         cmd += ["-loop", "1", "-framerate", f"{fps.numerator}/{fps.denominator}",
                 "-t", f"{total:.6f}", "-i", layer.path]
-        w = max(2, int(round(width * layer.scale)))
-        alpha = min(max(float(layer.opacity), 0.0), 1.0)
-        parts.append(f"[{image_input + n}:v]scale={w}:-1,format=rgba,"
-                     f"colorchannelmixer=aa={alpha:.6f}[img{n}]")
-        x = min(max(float(layer.x), 0.0), 1.0)
-        y = min(max(float(layer.y), 0.0), 1.0)
-        parts.append(f"{video_out}[img{n}]overlay=x=(W-w)*{x:.6f}:y=(H-h)*{y:.6f}:"
+        anim = layer.anim or {}
+        if anim.get("scale"):
+            scale_expr = expression(anim["scale"], layer.start, layer.end, layer.scale)
+            scale = (f"scale=w='max(2,round({width}*({scale_expr})/2)*2)':h=-2:eval=frame")
+        else:
+            scale = f"scale={max(2, int(round(width * layer.scale)))}:-1"
+        if anim.get("opacity"):
+            alpha_expr = expression(anim["opacity"], layer.start, layer.end, layer.opacity, var="T")
+            parts.append(f"[{image_input + n}:v]{scale},format=rgba,"
+                         f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+                         f"a='alpha(X,Y)*clip({alpha_expr},0,1)'[img{n}]")
+        else:
+            alpha = min(max(float(layer.opacity), 0.0), 1.0)
+            parts.append(f"[{image_input + n}:v]{scale},format=rgba,"
+                         f"colorchannelmixer=aa={alpha:.6f}[img{n}]")
+        if anim.get("x"):
+            x = "(" + expression(anim["x"], layer.start, layer.end, layer.x) + ")"
+        else:
+            x = f"{min(max(float(layer.x), 0.0), 1.0):.6f}"
+        if anim.get("y"):
+            y = "(" + expression(anim["y"], layer.start, layer.end, layer.y) + ")"
+        else:
+            y = f"{min(max(float(layer.y), 0.0), 1.0):.6f}"
+        parts.append(f"{video_out}[img{n}]overlay=x='(W-w)*{x}':y='(H-h)*{y}':"
                      f"enable='between(t,{layer.start:.6f},{layer.end:.6f})'[vimg{n}]")
         video_out = f"[vimg{n}]"
 

@@ -32,34 +32,34 @@ Tested on Windows: preview, export and timeline thumbnails match. Fixed on the w
 - [x] 9b Text on the preview + drag to position. Files: ui/player.py, ui/overlay_view.py
 - [x] 9c Text panel (size, color, shadow, outline) + text lane on the timeline for start/end. Files: ui/panels/text_panel.py, ui/timeline.py
 
-## Step 10 - Speed + export settings
-- [ ] 10a Clip speed: data + preview + export (setpts / atempo)
-- [ ] 10b Export settings: resolution, quality, format. Files: core/export.py (ExportSettings), ui/export_dialog.py
+## Step 10 - Speed + export settings - DONE (not yet tested on Windows)
+- [x] 10a Clip speed: data + preview + export (setpts / atempo)
+- [x] 10b Export settings: resolution, quality, format. Files: core/export.py (ExportSettings), ui/export_settings.py
 
-## Step 11 - Project handling
-- [ ] 11a Undo / redo. Files: core/history.py, core/clips.py
-- [ ] 11b Save / open project file. Files: core/project_io.py
-- [ ] 11c Autosave + full keyboard shortcuts (also pause the preview while exporting)
+## Step 11 - Project handling - DONE (not yet tested on Windows)
+- [x] 11a Undo / redo. Files: core/history.py, core/clips.py
+- [x] 11b Save / open project file. Files: core/project_io.py
+- [x] 11c Autosave + full keyboard shortcuts (preview pauses while exporting)
 
-## Step 12 - Finish the simple editor
-- [ ] 12a Dark theme + hardware decoding toggle
-- [ ] 12b App icon + PyInstaller .exe (mpv-2.dll, vulkan-1.dll, ffmpeg)
+## Step 12 - Finish the simple editor - DONE (not yet tested on Windows)
+- [x] 12a Dark theme + hardware decoding toggle
+- [x] 12b App icon + PyInstaller spec / build.bat (not built here; run `build.bat` on Windows)
 
-## Advanced features (only after Step 12 works)
-### Step 13 - Image overlays
-- [ ] 13a ImageLayer in core/layers.py + export (overlay filter)
-- [ ] 13b Preview + drag / scale on the preview
-- [ ] 13c Image panel (position, scale, opacity, start/end, order) + lane
+## Advanced features
+### Step 13 - Image overlays - DONE (not yet tested on Windows)
+- [x] 13a ImageLayer in core/layers.py + export (overlay filter)
+- [x] 13b Preview + drag on the preview
+- [x] 13c Image panel (position, scale, opacity, start/end, order) + lane
 
-### Step 14 - Keyframes 1
-- [ ] 14a Keyframe engine, pure + no UI: core/keyframes.py (value at time t; linear / hold / ease)
-- [ ] 14b Animate layer position / scale / opacity: export + preview
-- [ ] 14c Keyframe lane + diamonds on the timeline
+### Step 14 - Keyframes 1 - DONE (not yet tested on Windows)
+- [x] 14a Keyframe engine, pure + no UI: core/keyframes.py (value at time t; linear / hold / ease)
+- [x] 14b Animate layer position / scale / opacity: export + preview
+- [x] 14c Keyframe diamonds on the timeline (text / image / audio)
 
 ### Step 15 - Keyframes 2
 - [ ] 15a Animate the video clip (position, scale, rotation, opacity): preview + export
-- [ ] 15b Animate text properties + audio volume
-- [ ] 15c Copy / paste keyframes
+- [x] 15b Animate text properties + audio volume
+- [x] 15c Copy / paste keyframes (Keyframe panel)
 
 ### Step 16 - Smart masking 1
 - [ ] 16a Check current model options and tell the owner the choice first; download on first use; must run on a CPU-only laptop. Files: core/ai/model.py
@@ -81,5 +81,6 @@ Tested on Windows: preview, export and timeline thumbnails match. Fixed on the w
 
 ## Notes
 - Steps 4 and 5 were tested on Linux only, never on Windows.
-- The preview keeps playing while the export dialog is open (harmless; pause it in 11c).
-- There is no undo until 11a: Delete cannot be undone.
+- Steps 10-15b were not run on Windows yet. Test speed, export formats, save / open, undo, images and keyframes first.
+- 15a (video-clip keyframes) is still open: it needs a per-frame transform in the export (zoompan / overlay), so it is bigger than the layer keyframes.
+- Step 16 needs an owner decision first (model + size + CPU-only speed). Do not pick one silently.

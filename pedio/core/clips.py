@@ -330,6 +330,18 @@ class Project(QObject):
         self.changed.emit()
         return layer
 
+    def move_image_layer(self, layer_id, index):
+        """Change the drawing order (later layers are drawn on top)."""
+        i = self.image_index_of(layer_id)
+        if i < 0:
+            return False
+        index = min(max(int(index), 0), len(self.image_layers) - 1)
+        if index == i:
+            return False
+        self.image_layers.insert(index, self.image_layers.pop(i))
+        self.changed.emit()
+        return True
+
     def remove_image_layer(self, layer_id):
         i = self.image_index_of(layer_id)
         if i < 0:
